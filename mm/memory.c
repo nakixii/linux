@@ -4871,6 +4871,8 @@ static vm_fault_t do_anonymous_page(struct vm_fault *vmf)
 	count_mthp_stat(folio_order(folio), MTHP_STAT_ANON_FAULT_ALLOC);
 	folio_add_new_anon_rmap(folio, vma, addr, RMAP_EXCLUSIVE);
 	folio_add_lru_vma(folio, vma);
+	if (nr_pages > 1)
+		deferred_split_folio(folio, false);
 setpte:
 	if (vmf_orig_pte_uffd_wp(vmf))
 		entry = pte_mkuffd_wp(entry);
