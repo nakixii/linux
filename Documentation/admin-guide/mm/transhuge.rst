@@ -205,7 +205,11 @@ PMD-mappable transparent hugepage::
 All THPs at fault and collapse time will be added to _deferred_list,
 and will therefore be split under memory presure if they are considered
 "underused". A THP is underused if the number of zero-filled pages in
-the THP is above max_ptes_none (see below). It is possible to disable
+the THP is above max_ptes_none (see below). For an anonymous mTHP,
+max_ptes_none is scaled down by the ratio of its size to the PMD size,
+but not below half the mTHP's pages. A THP still in one of the two
+youngest MGLRU generations, or off the LRU, is left on the queue until
+it ages, as it may not be filled yet. It is possible to disable
 this behaviour by writing 0 to shrink_underused, and enable it by writing
 1 to it::
 

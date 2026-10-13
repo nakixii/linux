@@ -3655,7 +3655,10 @@ void deferred_split_folio(struct folio *folio, bool partially_mapped)
 	if (folio_order(folio) <= 1)
 		return;
 
-	if (!partially_mapped && !split_underused_thp)
+	/* Then thp_underused() is always false. */
+	if (!partially_mapped &&
+	    (!split_underused_thp ||
+	     khugepaged_max_ptes_none == HPAGE_PMD_NR - 1))
 		return;
 
 	/*
@@ -3707,12 +3710,50 @@ static unsigned long deferred_split_count(struct shrinker *shrink,
 	return READ_ONCE(ds_queue->split_queue_len);
 }
 
+/*
+ * A folio in one of the two youngest generations is likely still being
+ * filled, as a large anon folio is right after its fault.  Look at it again
+ * when it has aged, rather than split it for pages it is about to use.  So
+ * too a folio off the LRU, which reclaim or migration has taken: a split
+ * would fail on their reference anyway.
+ */
+static bool thp_still_young(struct folio *folio)
+{
+#ifdef CONFIG_LRU_GEN
+	int gen = folio_lru_gen(folio);
+	bool young;
+
+	if (!lru_gen_enabled())
+		return false;
+	if (gen < 0)
+		return true;
+
+	rcu_read_lock();
+	young = lru_gen_is_active(folio_lruvec(folio), gen);
+	rcu_read_unlock();
+	return young;
+#else
+	return false;
+#endif
+}
+
 static bool thp_underused(struct folio *folio)
 {
 	int num_zero_pages = 0, num_filled_pages = 0;
+	int nr = folio_nr_pages(folio);
+	/* max_ptes_none applies to a PMD; scale it down to the folio. */
+	int max_ptes_none = khugepaged_max_ptes_none >>
+			    (HPAGE_PMD_ORDER - folio_order(folio));
 	int i;
 
-	if (khugepaged_max_ptes_none == HPAGE_PMD_NR - 1)
+	/*
+	 * Splitting an mTHP gives up its contiguous mapping and has reclaim
+	 * compress it page by page, so keep one that is at least half used.
+	 */
+	if (folio_order(folio) < HPAGE_PMD_ORDER)
+		max_ptes_none = max(max_ptes_none, nr / 2);
+
+	if (max_ptes_none >= nr - 1)
 		return false;
 
 	if (folio_test_hwpoison(folio) || folio_test_has_hwpoisoned(folio))
@@ -3720,18 +3761,38 @@ static bool thp_underused(struct folio *folio)
 
 	for (i = 0; i < folio_nr_pages(folio); i++) {
 		if (pages_identical(folio_page(folio, i), ZERO_PAGE(0))) {
-			if (++num_zero_pages > khugepaged_max_ptes_none)
+			if (++num_zero_pages > max_ptes_none)
 				return true;
 		} else {
 			/*
 			 * Another path for early exit once the number
 			 * of non-zero filled pages exceeds threshold.
 			 */
-			if (++num_filled_pages >= HPAGE_PMD_NR - khugepaged_max_ptes_none)
+			if (++num_filled_pages >= nr - max_ptes_none)
 				return false;
 		}
 	}
 	return false;
+}
+
+/*
+ * Take a folio that is not partially mapped off the scan's list, under the
+ * lock: a racing unmap that finds it still listed would not queue it again.
+ */
+static bool thp_unqueue_used(struct deferred_split *ds_queue,
+			     struct folio *folio)
+{
+	unsigned long flags;
+	bool unqueued = false;
+
+	spin_lock_irqsave(&ds_queue->split_queue_lock, flags);
+	if (!folio_test_partially_mapped(folio)) {
+		list_del_init(&folio->_deferred_list);
+		ds_queue->split_queue_len--;
+		unqueued = true;
+	}
+	spin_unlock_irqrestore(&ds_queue->split_queue_lock, flags);
+	return unqueued;
 }
 
 static unsigned long deferred_split_scan(struct shrinker *shrink,
@@ -3742,7 +3803,7 @@ static unsigned long deferred_split_scan(struct shrinker *shrink,
 	unsigned long flags;
 	LIST_HEAD(list);
 	struct folio *folio, *next, *prev = NULL;
-	int split = 0, removed = 0;
+	int split = 0;
 
 #ifdef CONFIG_MEMCG
 	if (sc->memcg)
@@ -3753,7 +3814,14 @@ static unsigned long deferred_split_scan(struct shrinker *shrink,
 	/* Take pin on all head pages to avoid freeing them under us */
 	list_for_each_entry_safe(folio, next, &ds_queue->split_queue,
 							_deferred_list) {
-		if (folio_try_get(folio)) {
+		if (!folio_test_lru(folio)) {
+			/*
+			 * Not yet added to the LRU, or isolated by reclaim or
+			 * migration: a pin now would only make them fail.
+			 */
+			list_move_tail(&folio->_deferred_list,
+				       &ds_queue->split_queue);
+		} else if (folio_try_get(folio)) {
 			list_move(&folio->_deferred_list, &list);
 		} else {
 			/* We lost race with folio_put() */
@@ -3773,14 +3841,23 @@ static unsigned long deferred_split_scan(struct shrinker *shrink,
 	list_for_each_entry_safe(folio, next, &list, _deferred_list) {
 		bool did_split = false;
 		bool underused = false;
+		bool young = false;
 
 		if (!folio_test_partially_mapped(folio)) {
+			young = thp_still_young(folio);
+			if (young)
+				goto next;
 			underused = thp_underused(folio);
 			if (!underused)
 				goto next;
 		}
 		if (!folio_trylock(folio))
 			goto next;
+		/* Mapped whole again since, as by a memcomp rollback? */
+		if (!underused && !folio_test_partially_mapped(folio)) {
+			folio_unlock(folio);
+			goto next;
+		}
 		if (!split_folio(folio)) {
 			did_split = true;
 			if (underused)
@@ -3794,16 +3871,16 @@ next:
 		 * Only add back to the queue if folio is partially mapped.
 		 * If thp_underused returns false, or if split_folio fails
 		 * in the case it was underused, then consider it used and
-		 * don't add it back to split_queue.
+		 * don't add it back to split_queue.  A young folio stays
+		 * queued until it is old enough to tell.
 		 */
 		if (did_split) {
 			; /* folio already removed from list */
-		} else if (!folio_test_partially_mapped(folio)) {
-			list_del_init(&folio->_deferred_list);
-			removed++;
+		} else if (!young && thp_unqueue_used(ds_queue, folio)) {
+			; /* folio removed from list */
 		} else {
 			/*
-			 * That unlocked list_del_init() above would be unsafe,
+			 * An unlocked list_del_init() would be unsafe,
 			 * unless its folio is separated from any earlier folios
 			 * left on the list (which may be concurrently unqueued)
 			 * by one safe folio with refcount still raised.
@@ -3816,7 +3893,6 @@ next:
 
 	spin_lock_irqsave(&ds_queue->split_queue_lock, flags);
 	list_splice_tail(&list, &ds_queue->split_queue);
-	ds_queue->split_queue_len -= removed;
 	spin_unlock_irqrestore(&ds_queue->split_queue_lock, flags);
 
 	if (prev)
