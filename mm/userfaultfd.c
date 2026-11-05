@@ -15,6 +15,7 @@
 #include <linux/mmu_notifier.h>
 #include <linux/hugetlb.h>
 #include <linux/shmem_fs.h>
+#include <linux/memcomp.h>
 #include <asm/tlbflush.h>
 #include <asm/tlb.h>
 #include "internal.h"
@@ -1150,6 +1151,9 @@ static int move_pages_pte(struct mm_struct *mm, pmd_t *dst_pmd, pmd_t *src_pmd,
 	struct anon_vma *src_anon_vma = NULL;
 	struct mmu_notifier_range range;
 	int err = 0;
+	swp_entry_t memcomp_checked_entry = { };
+	bool memcomp_token_checked = false;
+	struct memcomp_ref memcomp_checked_ref = { };
 
 	flush_cache_range(src_vma, src_addr, src_addr + PAGE_SIZE);
 	mmu_notifier_range_init(&range, MMU_NOTIFY_CLEAR, 0, mm,
@@ -1338,6 +1342,77 @@ retry:
 		struct folio *folio = NULL;
 
 		entry = pte_to_swp_entry(orig_src_pte);
+		if (is_memcomp_entry(entry)) {
+			int resident;
+
+			if (!pte_swp_exclusive(orig_src_pte)) {
+				err = -EBUSY;
+				goto out;
+			}
+			/*
+			 * A resident token must be faulted back where its
+			 * folio's rmap expects it; the present-pte path then
+			 * moves the folio.  Any other token carries no
+			 * address and moves like a swap entry.
+			 *
+			 * pte_offset_map_nolock() leaves us in an RCU read-side
+			 * section.  Drop both mappings before querying the token:
+			 * memcomp_entry_resident_get() may take the token mutex when
+			 * it wins its trylock, and lockdep quite correctly rejects
+			 * even that conditional mutex acquisition in this context.
+			 * The PTEs are revalidated by retry before either move path.
+			 */
+			/* Zero is a pure value: MOVE keeps its logical owner count. */
+			if (!swp_offset(entry)) {
+				err = move_swap_pte(mm, dst_vma, dst_addr, src_addr,
+						    dst_pte, src_pte, orig_dst_pte,
+						    orig_src_pte, dst_ptl, src_ptl, NULL);
+				goto out;
+			}
+			if (!memcomp_token_checked ||
+			    memcomp_checked_entry.val != entry.val) {
+				if (memcomp_checked_ref.slot)
+					memcomp_entry_resident_put(&memcomp_checked_ref);
+				pte_unmap(src_pte);
+				pte_unmap(dst_pte);
+				dst_pte = NULL;
+				src_pte = NULL;
+				resident = memcomp_entry_resident_get(swp_offset(entry),
+								      &memcomp_checked_ref);
+				if (resident < 0) {
+					err = resident;
+					goto out;
+				}
+				if (resident) {
+					struct vm_fault vmf = {
+						.vma = src_vma,
+						.address = src_addr,
+						.pgoff = linear_page_index(src_vma, src_addr),
+						.pmd = src_pmd,
+						.orig_pte = orig_src_pte,
+					};
+
+					err = memcomp_restore_resident(&vmf,
+								       &memcomp_checked_ref);
+					memcomp_token_checked = false;
+					if (!err)
+						goto retry;
+					goto out;
+				}
+				if (!memcomp_checked_ref.slot) {
+					/* Do not move a stale token without a stable entry. */
+					err = -EAGAIN;
+					goto out;
+				}
+				memcomp_checked_entry = entry;
+				memcomp_token_checked = true;
+				goto retry;
+			}
+			err = move_swap_pte(mm, dst_vma, dst_addr, src_addr,
+					    dst_pte, src_pte, orig_dst_pte,
+					    orig_src_pte, dst_ptl, src_ptl, NULL);
+			goto out;
+		}
 		if (non_swap_entry(entry)) {
 			if (is_migration_entry(entry)) {
 				pte_unmap(src_pte);
@@ -1400,6 +1475,8 @@ retry:
 	}
 
 out:
+	if (memcomp_checked_ref.slot)
+		memcomp_entry_resident_put(&memcomp_checked_ref);
 	if (src_anon_vma) {
 		anon_vma_unlock_write(src_anon_vma);
 		put_anon_vma(src_anon_vma);
