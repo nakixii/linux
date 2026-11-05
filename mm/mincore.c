@@ -281,6 +281,27 @@ static const struct mm_walk_ops mincore_walk_ops = {
 	.walk_lock		= PGWALK_RDLOCK,
 };
 
+#ifdef CONFIG_MEMCOMP_KUNIT_TEST
+#define MC16_MINCORE_DECLARE_TEST_API
+#include "memcomp/tests/mincore_test.h"
+#undef MC16_MINCORE_DECLARE_TEST_API
+#endif
+
+#ifdef CONFIG_MEMCOMP_KUNIT_TEST
+/* Test-only entry points retain the real cache lookup and PTE walk. */
+unsigned char memcomp_test_mincore_page(struct address_space *mapping,
+					pgoff_t index)
+{
+	return mincore_page(mapping, index);
+}
+
+int memcomp_test_mincore_walk(struct mm_struct *mm, unsigned long start,
+			      unsigned long end, unsigned char *vec)
+{
+	return walk_page_range(mm, start, end, &mincore_walk_ops, vec);
+}
+#endif
+
 /*
  * Do a chunk of "sys_mincore()". We've already checked
  * all the arguments, we hold the mmap semaphore: we should

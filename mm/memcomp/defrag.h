@@ -6,6 +6,9 @@
 /* Include after memcomp_defrag_ops, its scan/move limits, swapoff.h and scan.h. */
 static inline void *mc16_defrag_buffer_alloc(void)
 {
+#ifdef CONFIG_MEMCOMP_KUNIT_TEST
+	KUNIT_STATIC_STUB_REDIRECT(mc16_defrag_buffer_alloc);
+#endif
 	return kmalloc(PAGE_SIZE, GFP_NOWAIT | __GFP_NOWARN);
 }
 
@@ -17,6 +20,9 @@ static inline int mc16_defrag_copy_payload(const void *src, unsigned int bytes,
 	unsigned int copied = 0;
 	int ret;
 
+#ifdef CONFIG_MEMCOMP_KUNIT_TEST
+	KUNIT_STATIC_STUB_REDIRECT(mc16_defrag_copy_payload, src, bytes, payload);
+#endif
 	ret = memcomp_alloc_raw_payload(0, src, bytes, &copied, &handle,
 					false, NULL);
 	if (!ret)

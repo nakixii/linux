@@ -3,6 +3,9 @@
 #define _MM_MEMCOMP_WRITEBACK_BATCH_H
 
 #ifdef CONFIG_SWAP
+#ifdef CONFIG_MEMCOMP_KUNIT_TEST
+#include <kunit/static_stub.h>
+#endif
 
 /*
  * Include in memcomp.c after the old writeback batch implementation.  Uses
@@ -52,17 +55,26 @@ static unsigned int mc16_writeback_open_bytes;
 /* Test seams preserve the production allocator, submit and backing APIs. */
 static int mc16_writeback_folio_alloc(struct folio **folio, swp_entry_t *swap)
 {
+#ifdef CONFIG_MEMCOMP_KUNIT_TEST
+	KUNIT_STATIC_STUB_REDIRECT(mc16_writeback_folio_alloc, folio, swap);
+#endif
 	return memcomp_swap_folio_alloc(folio, swap);
 }
 
 static void mc16_writeback_submit(struct folio *folio,
 				  struct writeback_control *wbc)
 {
+#ifdef CONFIG_MEMCOMP_KUNIT_TEST
+	KUNIT_STATIC_STUB_REDIRECT(mc16_writeback_submit, folio, wbc);
+#endif
 	__swap_writepage(folio, wbc);
 }
 
 static int mc16_writeback_backing_dup(swp_entry_t swap)
 {
+#ifdef CONFIG_MEMCOMP_KUNIT_TEST
+	KUNIT_STATIC_STUB_REDIRECT(mc16_writeback_backing_dup, swap);
+#endif
 	return memcomp_slot_dup(swap);
 }
 

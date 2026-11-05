@@ -12,6 +12,24 @@
 static inline vm_fault_t mc16_load_resident(struct vm_fault *vmf,
 					    struct memcomp_ref *ref, bool *handled);
 
+#ifdef CONFIG_MEMCOMP_KUNIT_TEST
+/* Failure/race injection only. Successful data, allocation and charge are real. */
+static struct {
+	struct task_struct *task;
+	bool fail_large_alloc;
+	bool fail_small_alloc;
+	bool fail_large_charge;
+	bool fail_small_charge;
+	unsigned int large_allocs;
+	unsigned int small_allocs;
+	unsigned int large_charges;
+	unsigned int small_charges;
+	void (*after_alloc)(struct vm_fault *vmf, void *data);
+	void (*before_install)(struct vm_fault *vmf, void *data);
+	void *data;
+} mc16_fault_probe;
+#endif
+
 static inline vm_fault_t mc16_load(struct vm_fault *vmf, bool *locked)
 {
 	const unsigned int max_pages = MEMCOMP_MAX_COMPRESS_PAGES;
@@ -105,14 +123,41 @@ fallback_single:
 	id_start = id;
 fallback_alloc:
 	alloc_gfp = memcomp_fault_alloc_gfp(vma, nr_pages);
+#ifdef CONFIG_MEMCOMP_KUNIT_TEST
+	if (READ_ONCE(mc16_fault_probe.task) == current) {
+		if (nr_pages > 1)
+			mc16_fault_probe.large_allocs++;
+		else
+			mc16_fault_probe.small_allocs++;
+		if (nr_pages > 1 ? mc16_fault_probe.fail_large_alloc :
+				   mc16_fault_probe.fail_small_alloc)
+			goto alloc_failed;
+	}
+#endif
 	folio = vma_alloc_folio(alloc_gfp, order_base_2(nr_pages),
 				vma, start_addr, false);
 	if (!folio) {
+#ifdef CONFIG_MEMCOMP_KUNIT_TEST
+alloc_failed:
+#endif
 		if (nr_pages > 1)
 			goto fallback_single;
 		ret = VM_FAULT_OOM;
 		goto out_put;
 	}
+#ifdef CONFIG_MEMCOMP_KUNIT_TEST
+	if (READ_ONCE(mc16_fault_probe.task) == current) {
+		if (nr_pages > 1)
+			mc16_fault_probe.large_charges++;
+		else
+			mc16_fault_probe.small_charges++;
+	}
+	if (READ_ONCE(mc16_fault_probe.task) == current &&
+	    (nr_pages > 1 ? mc16_fault_probe.fail_large_charge :
+			   mc16_fault_probe.fail_small_charge))
+		err = -ENOMEM;
+	else
+#endif
 		err = mc16_user_charge(&refs[0], folio, vma->vm_mm, alloc_gfp);
 	if (err) {
 		if (nr_pages > 1) {
@@ -128,6 +173,10 @@ fallback_alloc:
 		*locked = true;
 	__folio_set_swapbacked(folio);
 	folio->swap.val = 0;
+#ifdef CONFIG_MEMCOMP_KUNIT_TEST
+	if (READ_ONCE(mc16_fault_probe.task) == current && mc16_fault_probe.after_alloc)
+		mc16_fault_probe.after_alloc(vmf, mc16_fault_probe.data);
+#endif
 	if (nr_pages > 1) {
 		struct memcomp_ref fault_ref = refs[0];
 		bool batch_ok = true;
@@ -192,6 +241,10 @@ fallback_alloc:
 	ret = VM_FAULT_MAJOR;
 	memcomp_arch_restore(id_start, folio);
 	__folio_mark_uptodate(folio);
+#ifdef CONFIG_MEMCOMP_KUNIT_TEST
+	if (READ_ONCE(mc16_fault_probe.task) == current && mc16_fault_probe.before_install)
+		mc16_fault_probe.before_install(vmf, mc16_fault_probe.data);
+#endif
 	/* No T survives mc16_load_page; PTL is acquired only after it returns. */
 	if (!memcomp_pte_map_lock(vma->vm_mm, vmf->pmd, vmf->address,
 				  &vmf->pte, &vmf->ptl))

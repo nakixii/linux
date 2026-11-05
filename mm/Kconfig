@@ -232,6 +232,19 @@ config MEMCOMP_DEBUG_STATS
 	  These counters add hot-path accounting and are intended for
 	  diagnosis and tuning.  If unsure, say N.
 
+config MEMCOMP_KUNIT_TEST
+	bool "KUnit tests for memcomp" if !KUNIT_ALL_TESTS
+	depends on MEMCOMP && KUNIT=y
+	select MEMCOMP_DEBUG_STATS
+	default KUNIT_ALL_TESTS
+	help
+	  Build unit tests for memcomp token bounds, reference lifetime,
+	  compression execution admission, payload states, allocation flags and
+	  failure attribution, same-filled pages and swap writeback selection.
+	  The tests run at boot and do not require a swap file.
+
+	  If unsure, say N.
+
 config ZBUD
 	tristate "2:1 compression allocator (zbud)"
 	depends on ZSWAP

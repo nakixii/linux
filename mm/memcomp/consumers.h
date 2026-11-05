@@ -74,6 +74,10 @@ static inline int mc16_cache_load(struct memcomp_ref *ref, struct folio *folio)
 	void *dst;
 	int ret;
 
+#ifdef CONFIG_MEMCOMP_KUNIT_TEST
+	KUNIT_STATIC_STUB_REDIRECT(mc16_cache_load, ref, folio);
+#endif
+
 	if (!ref || !ref->slot)
 		return -ENOENT;
 	if (!folio || folio_test_large(folio) || !folio_test_locked(folio))

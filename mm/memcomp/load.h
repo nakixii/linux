@@ -12,6 +12,10 @@ static inline int mc16_load_page(struct memcomp_ref *ref, void *dst)
 	void *src;
 	int ret;
 
+#ifdef CONFIG_MEMCOMP_KUNIT_TEST
+	KUNIT_STATIC_STUB_REDIRECT(mc16_load_page, ref, dst);
+#endif
+
 	if (!ref->slot || !dst)
 		return -EINVAL;
 	mutex_lock(memcomp_lock_of(ref->token));

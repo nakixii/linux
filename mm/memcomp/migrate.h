@@ -25,6 +25,9 @@ static inline int
 mc16_migrate_move_error(struct memcomp_ref *ref, struct folio *from,
 			struct folio *to, unsigned int index)
 {
+#ifdef CONFIG_MEMCOMP_KUNIT_TEST
+	KUNIT_STATIC_STUB_REDIRECT(mc16_migrate_move_error, ref, from, to, index);
+#endif
 	return 0;
 }
 

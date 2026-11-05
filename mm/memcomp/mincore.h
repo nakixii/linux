@@ -4,6 +4,9 @@
 
 #include <linux/pagemap.h>
 #include <linux/swap.h>
+#ifdef CONFIG_MEMCOMP_KUNIT_TEST
+#include <kunit/static_stub.h>
+#endif
 
 /* Include after storage/access/refs and the memcomp_slot_* helpers. */
 #ifdef CONFIG_SWAP
@@ -12,6 +15,9 @@ static struct folio *mc16_mincore_swap_folio(swp_entry_t swap)
 	struct swap_info_struct *si;
 	struct folio *folio;
 
+#ifdef CONFIG_MEMCOMP_KUNIT_TEST
+	KUNIT_STATIC_STUB_REDIRECT(mc16_mincore_swap_folio, swap);
+#endif
 	si = get_swap_device(swap);
 	if (!si)
 		return ERR_PTR(-ENOENT);

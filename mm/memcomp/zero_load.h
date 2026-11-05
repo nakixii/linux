@@ -5,6 +5,14 @@
 #include <linux/highmem.h>
 
 /* Include after zero.h and memcomp_pte_map_lock(), in memcomp.c. */
+#ifdef CONFIG_MEMCOMP_KUNIT_TEST
+/* Current-task failure injection only; successful data always uses real MM. */
+static struct {
+	struct task_struct *task;
+	bool fail_alloc;
+	bool fail_charge;
+} mc16_zero_fault_probe;
+#endif
 
 static inline vm_fault_t mc16_load_zero(struct vm_fault *vmf, bool *locked)
 {
@@ -18,9 +26,21 @@ static inline vm_fault_t mc16_load_zero(struct vm_fault *vmf, bool *locked)
 	ret = vmf_anon_prepare(vmf);
 	if (ret)
 		return ret;
+#ifdef CONFIG_MEMCOMP_KUNIT_TEST
+	if (READ_ONCE(mc16_zero_fault_probe.task) == current &&
+	    mc16_zero_fault_probe.fail_alloc)
+		return VM_FAULT_OOM;
+#endif
 	folio = vma_alloc_zeroed_movable_folio(vma, vmf->address);
 	if (!folio)
 		return VM_FAULT_OOM;
+#ifdef CONFIG_MEMCOMP_KUNIT_TEST
+	if (READ_ONCE(mc16_zero_fault_probe.task) == current &&
+	    mc16_zero_fault_probe.fail_charge) {
+		folio_put(folio);
+		return VM_FAULT_OOM;
+	}
+#endif
 	if (mem_cgroup_charge(folio, vma->vm_mm, GFP_HIGHUSER_MOVABLE)) {
 		folio_put(folio);
 		return VM_FAULT_OOM;
