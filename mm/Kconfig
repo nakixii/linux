@@ -217,6 +217,10 @@ config MEMCOMP_DEFAULT_COMPRESSOR
 	  for registration before trying zstd. Setup failures also fall back
 	  to zstd. Memcomp stays disabled if neither can be set up.
 
+	  The synchronous algorithm choice is final. A matching asynchronous
+	  implementation registered later can enable batched compression
+	  without changing that choice.
+
 config MEMCOMP_DEBUG_STATS
 	bool "Debug statistics for memcomp"
 	depends on MEMCOMP
