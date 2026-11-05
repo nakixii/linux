@@ -30,6 +30,7 @@ the Linux memory management.
    hugetlbpage
    idle_page_tracking
    ksm
+   memcomp
    memory-hotplug
    multigen_lru
    nommu-mmap
