@@ -78,6 +78,7 @@
 #include <linux/ptrace.h>
 #include <linux/vmalloc.h>
 #include <linux/sched/sysctl.h>
+#include <linux/memcomp.h>
 
 #include <trace/events/kmem.h>
 
@@ -818,6 +819,29 @@ copy_nonpresent_pte(struct mm_struct *dst_mm, struct mm_struct *src_mm,
 			set_pte_at(src_mm, addr, src_pte, pte);
 		}
 		rss[MM_SWAPENTS]++;
+	} else if (is_memcomp_entry(entry)) {
+		/*
+		 * Not -EIO.  That tells copy_pte_range() a swap count needs a
+		 * continuation page, and it answers by calling
+		 * add_swap_count_continuation() on this entry - whose type is
+		 * past MAX_SWAPFILES, so get_swap_device() logs a bad-entry
+		 * error and returns NULL, add_swap_count_continuation()
+		 * returns 0 rather than a failure, and the loop retries the
+		 * same pte for ever, one pr_err() per pass.
+		 *
+		 * A live memcomp pte holds a reference, so a failed lookup
+		 * here should not be possible; say so, and fail the fork
+		 * rather than hang it.
+		 */
+		if (!memcomp_entry_get(swp_offset(entry))) {
+			VM_WARN_ON_ONCE(1);
+			return -EBUSY;
+		}
+		rss[MM_SWAPENTS]++;
+		if (pte_swp_exclusive(orig_pte)) {
+			pte = pte_swp_clear_exclusive(orig_pte);
+			set_pte_at(src_mm, addr, src_pte, pte);
+		}
 	} else if (is_migration_entry(entry)) {
 		folio = pfn_swap_entry_folio(entry);
 
@@ -1651,6 +1675,15 @@ static unsigned long zap_pte_range(struct mmu_gather *tlb,
 				continue;
 			rss[MM_SWAPENTS] -= nr;
 			free_swap_and_cache_nr(entry, nr);
+		} else if (is_memcomp_entry(entry)) {
+			max_nr = (end - addr) / PAGE_SIZE;
+			nr = memcomp_pte_batch(pte, max_nr);
+			if (!nr)
+				nr = 1;
+			if (!should_zap_cows(details))
+				continue;
+			rss[MM_SWAPENTS] -= nr;
+			memcomp_invalidate_nr(swp_offset(entry), nr);
 		} else if (is_migration_entry(entry)) {
 			folio = pfn_swap_entry_folio(entry);
 			if (!should_zap_folio(details, folio))
@@ -4220,7 +4253,14 @@ vm_fault_t do_swap_page(struct vm_fault *vmf)
 
 	entry = pte_to_swp_entry(vmf->orig_pte);
 	if (unlikely(non_swap_entry(entry))) {
-		if (is_migration_entry(entry)) {
+		if (is_memcomp_entry(entry)) {
+			if (vmf->flags & FAULT_FLAG_VMA_LOCK) {
+				vma_end_read(vma);
+				ret = VM_FAULT_RETRY;
+				goto out;
+			}
+			ret = memcomp_load(vmf, NULL);
+		} else if (is_migration_entry(entry)) {
 			migration_entry_wait(vma->vm_mm, vmf->pmd,
 					     vmf->address);
 		} else if (is_device_exclusive_entry(entry)) {

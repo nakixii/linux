@@ -14802,6 +14802,14 @@ F:	mm/memblock.c
 F:	mm/mm_init.c
 F:	tools/testing/memblock/
 
+MEMCOMP IN-MEMORY COMPRESSION
+M:	nakixii <nakixii@gmail.com>
+L:	linux-mm@kvack.org
+S:	Experimental
+F:	include/linux/memcomp.h
+F:	mm/memcomp.c
+F:	mm/memcomp/
+
 MEMORY ALLOCATION PROFILING
 M:	Suren Baghdasaryan <surenb@google.com>
 M:	Kent Overstreet <kent.overstreet@linux.dev>
@@ -14852,7 +14860,6 @@ T:	git git://git.kernel.org/pub/scm/linux/kernel/git/akpm/mm
 T:	quilt git://git.kernel.org/pub/scm/linux/kernel/git/akpm/25-new
 F:	include/linux/gfp.h
 F:	include/linux/gfp_types.h
-F:	include/linux/memcomp.h
 F:	include/linux/memfd.h
 F:	include/linux/memory.h
 F:	include/linux/memory_hotplug.h

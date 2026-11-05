@@ -43,6 +43,7 @@
 #include <linux/suspend.h>
 #include <linux/zswap.h>
 #include <linux/plist.h>
+#include <linux/memcomp.h>
 
 #include <asm/tlbflush.h>
 #include <linux/swapops.h>
@@ -1633,6 +1634,11 @@ void swap_free_nr(swp_entry_t entry, int nr_pages)
 	struct swap_info_struct *sis;
 	unsigned long offset = swp_offset(entry);
 
+	if (is_memcomp_entry(entry)) {
+		memcomp_invalidate_nr(offset, nr_pages);
+		return;
+	}
+
 	sis = _swap_info_get(entry);
 	if (!sis)
 		return;
@@ -1895,6 +1901,11 @@ void free_swap_and_cache_nr(swp_entry_t entry, int nr)
 	struct swap_info_struct *si;
 	bool any_only_cache = false;
 	unsigned long offset;
+
+	if (is_memcomp_entry(entry)) {
+		memcomp_invalidate_nr(swp_offset(entry), nr);
+		return;
+	}
 
 	if (non_swap_entry(entry))
 		return;

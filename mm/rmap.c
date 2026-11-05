@@ -76,6 +76,7 @@
 #include <linux/userfaultfd_k.h>
 #include <linux/mm_inline.h>
 #include <linux/oom.h>
+#include <linux/memcomp.h>
 
 #include <asm/tlbflush.h>
 
@@ -1852,14 +1853,23 @@ static bool try_to_unmap_one(struct folio *folio, struct vm_area_struct *vma,
 			dec_mm_counter(mm, mm_counter(folio));
 		} else if (folio_test_anon(folio)) {
 			swp_entry_t entry = page_swap_entry(subpage);
+			/* A reserved token, not an incompressible mark. */
+			bool reserved = folio_memcomp_reserved(folio);
 			pte_t swp_pte;
 			/*
 			 * Store the swap location in the pte.
 			 * See handle_pte_fault() ...
 			 */
 			if (unlikely(folio_test_swapbacked(folio) !=
-					folio_test_swapcache(folio))) {
+					folio_test_swapcache(folio)) && !reserved) {
 				WARN_ON_ONCE(1);
+				goto walk_abort;
+			}
+
+			/* Swapbacked folios take their token reference below. */
+			if (reserved && !folio_test_swapbacked(folio) &&
+			    !memcomp_entry_present(swp_offset(entry))) {
+				set_pte_at(mm, address, pvmw.pte, pteval);
 				goto walk_abort;
 			}
 
@@ -1913,12 +1923,20 @@ static bool try_to_unmap_one(struct folio *folio, struct vm_area_struct *vma,
 				goto walk_abort;
 			}
 
-			if (swap_duplicate(entry) < 0) {
+			if (reserved) {
+				if (!memcomp_entry_get(swp_offset(entry))) {
+					set_pte_at(mm, address, pvmw.pte, pteval);
+					goto walk_abort;
+				}
+			} else if (swap_duplicate(entry) < 0) {
 				set_pte_at(mm, address, pvmw.pte, pteval);
 				goto walk_abort;
 			}
 			if (arch_unmap_one(mm, vma, address, pteval) < 0) {
-				swap_free(entry);
+				if (reserved)
+					memcomp_invalidate(swp_offset(entry));
+				else
+					swap_free(entry);
 				set_pte_at(mm, address, pvmw.pte, pteval);
 				goto walk_abort;
 			}
@@ -1926,7 +1944,10 @@ static bool try_to_unmap_one(struct folio *folio, struct vm_area_struct *vma,
 			/* See folio_try_share_anon_rmap(): clear PTE first. */
 			if (anon_exclusive &&
 			    folio_try_share_anon_rmap_pte(folio, subpage)) {
-				swap_free(entry);
+				if (reserved)
+					memcomp_invalidate(swp_offset(entry));
+				else
+					swap_free(entry);
 				set_pte_at(mm, address, pvmw.pte, pteval);
 				goto walk_abort;
 			}

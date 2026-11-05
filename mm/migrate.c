@@ -44,6 +44,7 @@
 #include <linux/sched/sysctl.h>
 #include <linux/memory-tiers.h>
 #include <linux/pagewalk.h>
+#include <linux/memcomp.h>
 
 #include <asm/tlbflush.h>
 
@@ -757,6 +758,7 @@ static int __migrate_folio(struct address_space *mapping, struct folio *dst,
 			   enum migrate_mode mode)
 {
 	int rc, expected_count = folio_expected_refs(mapping, src);
+	int memcomp_migrated;
 
 	/* Check whether src does not have extra refs before we do more work */
 	if (folio_ref_count(src) != expected_count)
@@ -766,9 +768,16 @@ static int __migrate_folio(struct address_space *mapping, struct folio *dst,
 	if (unlikely(rc))
 		return rc;
 
+	memcomp_migrated = memcomp_migrate_folio(dst, src);
+	if (memcomp_migrated < 0)
+		return memcomp_migrated;
+
 	rc = __folio_migrate_mapping(mapping, dst, src, expected_count);
-	if (rc != MIGRATEPAGE_SUCCESS)
+	if (rc != MIGRATEPAGE_SUCCESS) {
+		if (memcomp_migrated > 0)
+			memcomp_migrate_folio_rollback(dst, src);
 		return rc;
+	}
 
 	if (src_private)
 		folio_attach_private(dst, folio_detach_private(src));

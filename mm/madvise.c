@@ -7,6 +7,7 @@
  */
 
 #include <linux/mman.h>
+#include <linux/memcomp.h>
 #include <linux/pagemap.h>
 #include <linux/syscalls.h>
 #include <linux/mempolicy.h>
@@ -680,7 +681,14 @@ static int madvise_free_pte_range(pmd_t *pmd, unsigned long addr,
 			swp_entry_t entry;
 
 			entry = pte_to_swp_entry(ptent);
-			if (!non_swap_entry(entry)) {
+			if (is_memcomp_entry(entry)) {
+				max_nr = (end - addr) / PAGE_SIZE;
+				nr = memcomp_pte_batch(pte, max_nr);
+				nr_swap -= nr;
+				memcomp_invalidate_nr(swp_offset(entry), nr);
+				clear_not_present_full_ptes(mm, addr, pte, nr,
+							    tlb->fullmm);
+			} else if (!non_swap_entry(entry)) {
 				max_nr = (end - addr) / PAGE_SIZE;
 				nr = swap_pte_batch(pte, max_nr, ptent);
 				nr_swap -= nr;

@@ -41,6 +41,9 @@
 #include <linux/compat.h>
 #include <linux/pgalloc_tag.h>
 #include <linux/pagewalk.h>
+#ifdef CONFIG_MEMCOMP
+#include <linux/memcomp.h>
+#endif
 
 #include <asm/tlb.h>
 #include <asm/pgalloc.h>
@@ -3417,6 +3420,14 @@ int split_huge_page_to_list_to_order(struct page *page, struct list_head *list,
 
 	if (folio_test_writeback(folio))
 		return -EBUSY;
+#ifdef CONFIG_MEMCOMP
+	if (is_anon && folio_test_swapbacked(folio) &&
+	    !folio_test_swapcache(folio) &&
+	    folio_memcomp_reserved(folio)) {
+		memcomp_count_split_refused(folio);
+		return -EBUSY;
+	}
+#endif
 
 	if (is_anon) {
 		/*
@@ -3692,6 +3703,39 @@ void deferred_split_folio(struct folio *folio, bool partially_mapped)
 		if (memcg)
 			set_shrinker_bit(memcg, folio_nid(folio),
 					 deferred_split_shrinker->id);
+#endif
+#ifdef CONFIG_MEMCOMP
+	}
+	spin_unlock_irqrestore(&ds_queue->split_queue_lock, flags);
+}
+
+/*
+ * Every page of @folio is mapped again, as when memcomp puts back the
+ * PTEs that reclaim replaced with its tokens before a store failed.  Undo
+ * deferred_split_folio(folio, true), so that neither reclaim nor the
+ * shrinker splits the folio as partially mapped; the shrinker drops it
+ * from the queue once it finds it no longer is.
+ *
+ * Called with the folio locked, which keeps split_folio() away.  The
+ * mapped count is read under split_queue_lock: an unmap that the read
+ * misses sets the flag again under that lock once it is dropped.
+ */
+void deferred_split_folio_remapped(struct folio *folio)
+{
+	struct deferred_split *ds_queue;
+	unsigned long flags;
+
+	VM_WARN_ON_ONCE_FOLIO(!folio_test_locked(folio), folio);
+	if (!folio_test_partially_mapped(folio))
+		return;
+
+	ds_queue = get_deferred_split_queue(folio);
+	spin_lock_irqsave(&ds_queue->split_queue_lock, flags);
+	if (folio_test_partially_mapped(folio) &&
+	    folio_nr_pages_mapped(folio) == folio_nr_pages(folio)) {
+		folio_clear_partially_mapped(folio);
+		mod_mthp_stat(folio_order(folio),
+			      MTHP_STAT_NR_ANON_PARTIALLY_MAPPED, -1);
 #endif
 	}
 	spin_unlock_irqrestore(&ds_queue->split_queue_lock, flags);
