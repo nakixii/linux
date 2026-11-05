@@ -46,6 +46,7 @@ documentation, or deleted if it has served its purpose.
    hwpoison
    hugetlbfs_reserv
    ksm
+   memcomp
    memory-model
    mmu_notifier
    multigen_lru
