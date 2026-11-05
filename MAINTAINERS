@@ -14809,6 +14809,7 @@ S:	Experimental
 F:	include/linux/memcomp.h
 F:	mm/memcomp.c
 F:	mm/memcomp/
+F:	tools/testing/selftests/mm/memcomp.c
 
 MEMORY ALLOCATION PROFILING
 M:	Suren Baghdasaryan <surenb@google.com>

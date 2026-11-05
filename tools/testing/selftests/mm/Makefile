@@ -43,6 +43,9 @@ LDLIBS = -lrt -lpthread -lm
 # warnings.
 CFLAGS += -U_FORTIFY_SOURCE
 
+# Run memcomp directly via kselftest; run_vmtests.sh need not invoke it.
+TEST_GEN_PROGS += memcomp_selftest
+
 TEST_GEN_FILES = cow
 TEST_GEN_FILES += compaction_test
 TEST_GEN_FILES += gup_longterm
@@ -139,8 +142,12 @@ TEST_FILES += write_hugetlb_memory.sh
 
 include ../lib.mk
 
-$(TEST_GEN_PROGS): vm_util.c thp_settings.c
+$(filter-out $(OUTPUT)/memcomp_selftest,$(TEST_GEN_PROGS)): vm_util.c thp_settings.c
 $(TEST_GEN_FILES): vm_util.c thp_settings.c
+
+$(OUTPUT)/memcomp_selftest: memcomp.c vm_util.h ../kselftest.h
+	@mkdir -p $(@D)
+	$(CC) $(filter-out -no-pie,$(CFLAGS)) $(CPPFLAGS) $(LDFLAGS) $(TARGET_ARCH) $< $(LDLIBS) -o $@
 
 $(OUTPUT)/uffd-stress: uffd-common.c
 $(OUTPUT)/uffd-unit-tests: uffd-common.c
