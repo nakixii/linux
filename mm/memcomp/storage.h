@@ -223,8 +223,26 @@ static inline void mc16_retained_empty_dec_locked(void)
 static inline void *mc16_kmalloc_owner(size_t bytes, gfp_t gfp,
 				       struct obj_cgroup *objcg)
 {
-	/* Metadata remains unaccounted until a source owner is introduced. */
-	return kmalloc(bytes, gfp & ~__GFP_ACCOUNT);
+	struct mem_cgroup *memcg = NULL, *old;
+	void *ptr;
+
+#ifdef CONFIG_MEMCG
+	if (objcg)
+		memcg = get_mem_cgroup_from_objcg(objcg);
+#endif
+	old = set_active_memcg(memcg);
+	/* An unaccounted/root source must not charge the submitting task. */
+	if (objcg)
+		gfp |= __GFP_ACCOUNT;
+	else
+		gfp &= ~__GFP_ACCOUNT;
+	ptr = kmalloc(bytes, gfp);
+	set_active_memcg(old);
+#ifdef CONFIG_MEMCG
+	if (memcg)
+		css_put(&memcg->css);
+#endif
+	return ptr;
 }
 
 static inline void *mc16_owner_alloc(size_t bytes, gfp_t gfp,
