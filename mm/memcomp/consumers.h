@@ -46,19 +46,74 @@ static inline void mc16_pte_put_nr(unsigned long token, unsigned int nr)
 }
 
 /* The caller removed one cache owner, independently of any PTE owner. */
+static inline void mc16_cache_drop(unsigned long token)
+{
+	struct memcomp_ref ref;
+
+	if (!token) {
+		mc16_zero_cache_put(1);
+		return;
+	}
+	if (mc16_get(token, &ref))
+		mc16_ref_put_count(&ref, 2); /* lookup + removed cache owner */
+}
 
 /* Empty output on failure, including token0; caller handles zero explicitly. */
+static inline bool mc16_cache_pin(unsigned long token, struct memcomp_ref *ref)
+{
+	return mc16_get(token, ref);
+}
 
 /*
  * Keep this same guard through load and the caller's xarray transaction.
  * Failure leaves both the guard and cache owner intact for abort/retry.
  */
+static inline int mc16_cache_load(struct memcomp_ref *ref, struct folio *folio)
+{
+	void *dst;
+	int ret;
+
+	if (!ref || !ref->slot)
+		return -ENOENT;
+	if (!folio || folio_test_large(folio) || !folio_test_locked(folio))
+		return -EINVAL;
+	dst = kmap_local_folio(folio, 0);
+	ret = mc16_load_page(ref, dst);
+	kunmap_local(dst);
+	if (!ret) {
+		__folio_mark_uptodate(folio);
+		flush_dcache_folio(folio);
+		memcomp_arch_restore(ref->token, folio);
+	}
+	return ret;
+}
+
+static inline void mc16_cache_abort(struct memcomp_ref *ref)
+{
+	if (ref && ref->slot)
+		mc16_ref_put(ref);
+}
 
 /* Only the winner replacing the expected cache shadow may consume its owner. */
+static inline void mc16_cache_commit(struct memcomp_ref *ref)
+{
+	if (ref && ref->slot)
+		mc16_ref_put_count(ref, 2); /* same guard + cache owner */
+}
 
 /*
  * Explicit token0 branch: no guard, lookup or owner consumption. After the
  * expected zero shadow is replaced successfully, caller must cache_drop(0).
  * An aborted xarray transaction leaves the zero cache owner unchanged.
  */
+static inline int mc16_cache_load_zero(struct folio *folio)
+{
+	if (!folio || folio_test_large(folio) || !folio_test_locked(folio))
+		return -EINVAL;
+	clear_highpage(folio_page(folio, 0));
+	__folio_mark_uptodate(folio);
+	flush_dcache_folio(folio);
+	memcomp_arch_restore(0, folio);
+	return 0;
+}
 #endif /* _MM_MEMCOMP_CONSUMERS_H */
