@@ -6278,15 +6278,94 @@ static void shrink_node_memcgs(pg_data_t *pgdat, struct scan_control *sc)
 	} while ((memcg = mem_cgroup_iter(target_memcg, memcg, partial)));
 }
 
+#ifdef CONFIG_MEMCOMP
+/*
+ * Packed payload writeback starts as soon as kswapd must work to
+ * rebalance the node, not only at direct-reclaim-level scarcity.
+ */
+static bool memcomp_writeback_node_below_mark(pg_data_t *pgdat,
+					      struct scan_control *sc,
+						  enum zone_watermarks mark)
+{
+	struct zone *zone;
+	bool found = false;
+	int reclaim_idx;
+	int z;
+
+	if (sc->reclaim_idx < 0)
+		return false;
+
+	reclaim_idx = min_t(int, sc->reclaim_idx, MAX_NR_ZONES - 1);
+	for (z = 0; z <= reclaim_idx; z++) {
+		zone = pgdat->node_zones + z;
+		if (!managed_zone(zone))
+			continue;
+		found = true;
+		if (zone_watermark_ok_safe(zone, 0, wmark_pages(zone, mark),
+					   reclaim_idx))
+			return false;
+	}
+
+	return found;
+}
+
+static bool memcomp_writeback_node_below_low(pg_data_t *pgdat,
+					     struct scan_control *sc)
+{
+	return memcomp_writeback_node_below_mark(pgdat, sc, WMARK_LOW);
+}
+
+static bool memcomp_writeback_node_under_min(pg_data_t *pgdat,
+					     struct scan_control *sc)
+{
+	return memcomp_writeback_node_below_mark(pgdat, sc, WMARK_MIN);
+}
+
+static bool memcomp_writeback_context_permitted(struct scan_control *sc)
+{
+	return root_reclaim(sc) && !cgroup_reclaim(sc) && !sc->proactive &&
+		!sc->hibernation_mode && !sc->order && sc->may_swap &&
+		sc->may_writepage && gfp_has_io_fs(sc->gfp_mask);
+}
+
+/*
+ * Keep packed writeback out of direct reclaim and out of the critical
+ * band: below min, kswapd reclaims the LRU undistracted while
+ * compression absorbs anonymous pages at a far better ratio than swap.
+ * Writeback only rides the moderate band between min and low, where
+ * kswapd has the spare capacity to drain the pool.  Scan priority alone
+ * does not open a scope.
+ */
+static bool memcomp_writeback_high_pressure(pg_data_t *pgdat, struct scan_control *sc)
+{
+	return current_is_kswapd() && lru_gen_enabled() &&
+		memcomp_writeback_context_permitted(sc) &&
+		memcomp_writeback_node_below_low(pgdat, sc) &&
+		!memcomp_writeback_node_under_min(pgdat, sc);
+}
+
+#endif
 static void shrink_node(pg_data_t *pgdat, struct scan_control *sc)
 {
 	unsigned long nr_reclaimed, nr_scanned, nr_node_reclaimed;
 	struct lruvec *target_lruvec;
 	bool reclaimable = false;
+#ifdef CONFIG_MEMCOMP
+	bool memcomp_writeback;
+#endif
 
+#ifdef CONFIG_MEMCOMP
+	memcomp_writeback = memcomp_writeback_high_pressure(pgdat, sc);
+	if (memcomp_writeback)
+		memcomp_reclaim_writeback_begin(pgdat->node_id, sc->reclaim_idx);
+#endif
 	if (lru_gen_enabled() && root_reclaim(sc)) {
 		lru_gen_shrink_node(pgdat, sc);
+#ifdef CONFIG_MEMCOMP
+		goto out_memcomp_writeback;
+#else
 		return;
+#endif
 	}
 
 	target_lruvec = mem_cgroup_lruvec(sc->target_mem_cgroup, pgdat);
@@ -6389,6 +6468,11 @@ again:
 		pgdat->kswapd_failures = 0;
 	else if (sc->cache_trim_mode)
 		sc->cache_trim_mode_failed = 1;
+#ifdef CONFIG_MEMCOMP
+out_memcomp_writeback:
+	if (memcomp_writeback)
+		memcomp_reclaim_writeback_end(pgdat->node_id);
+#endif
 }
 
 /*
