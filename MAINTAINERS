@@ -14866,6 +14866,7 @@ MEMCOMP IN-MEMORY COMPRESSION
 M:	nakixii <nakixii@gmail.com>
 L:	linux-mm@kvack.org
 S:	Experimental
+F:	Documentation/mm/memcomp.rst
 F:	include/linux/memcomp.h
 F:	mm/memcomp.c
 F:	mm/memcomp/
