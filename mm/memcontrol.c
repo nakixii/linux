@@ -3464,6 +3464,79 @@ struct mem_cgroup *mem_cgroup_from_id(unsigned short id)
 }
 EXPORT_SYMBOL_GPL(mem_cgroup_from_id);
 
+#ifdef CONFIG_MEMCOMP
+/*
+ * The caller stabilizes an ordinary anon/shmem folio's memcg binding, e.g.
+ * with the folio lock. Unlike objcg, this identity must not follow reparenting.
+ * Uncharged folios belong to root, which has a real, independently pinned ID.
+ * ID 0 selects the fault mm only for disabled or already retired identities.
+ * An online identity that cannot be pinned must fail reserve, not become ID 0.
+ */
+int mem_cgroup_memcomp_id_get_checked(struct folio *folio, unsigned short *id)
+{
+	struct mem_cgroup *memcg;
+	int ret = 0;
+
+	*id = 0;
+	if (mem_cgroup_disabled())
+		return 0;
+
+	rcu_read_lock();
+	memcg = folio_memcg(folio);
+	if (!memcg)
+		memcg = root_mem_cgroup;
+	if (refcount_inc_not_zero(&memcg->id.ref)) {
+		*id = mem_cgroup_id(memcg);
+	} else if (css_tryget_online(&memcg->css)) {
+		/* Online state normally already owns an ID reference. */
+		css_put(&memcg->css);
+		ret = -EAGAIN;
+	}
+	rcu_read_unlock();
+	return ret;
+}
+
+/* Convenience for callers with an already known, available source identity. */
+unsigned short mem_cgroup_memcomp_id_get(struct folio *folio)
+{
+	unsigned short id;
+
+	WARN_ON_ONCE(mem_cgroup_memcomp_id_get_checked(folio, &id));
+	return id;
+}
+
+/* The caller keeps its existing ID reference until this operation returns. */
+bool mem_cgroup_memcomp_id_get_ref(unsigned short id)
+{
+	struct mem_cgroup *memcg;
+	bool got;
+
+	if (!id)
+		return true;
+	if (mem_cgroup_disabled())
+		return false;
+
+	rcu_read_lock();
+	memcg = mem_cgroup_from_id(id);
+	got = memcg && refcount_inc_not_zero(&memcg->id.ref);
+	rcu_read_unlock();
+	return got;
+}
+
+void mem_cgroup_memcomp_id_put(unsigned short id)
+{
+	struct mem_cgroup *memcg;
+
+	if (!id || mem_cgroup_disabled())
+		return;
+	rcu_read_lock();
+	memcg = mem_cgroup_from_id(id);
+	if (!WARN_ON_ONCE(!memcg))
+		mem_cgroup_id_put(memcg);
+	rcu_read_unlock();
+}
+#endif
+
 #ifdef CONFIG_SHRINKER_DEBUG
 struct mem_cgroup *mem_cgroup_get_from_ino(unsigned long ino)
 {
@@ -4635,6 +4708,32 @@ int mem_cgroup_swapin_charge_folio(struct folio *folio, struct mm_struct *mm,
 	css_put(&memcg->css);
 	return ret;
 }
+
+#ifdef CONFIG_MEMCOMP
+/*
+ * Same charge and offline fallback as swapin, without a real swap entry or
+ * any swap accounting. The source ID is kept alive by the slot's key.
+ */
+int mem_cgroup_memcomp_charge(struct folio *folio, struct mm_struct *mm,
+			      gfp_t gfp, unsigned short id)
+{
+	struct mem_cgroup *memcg;
+	int ret;
+
+	if (mem_cgroup_disabled())
+		return 0;
+
+	rcu_read_lock();
+	memcg = mem_cgroup_from_id(id);
+	if (!memcg || !css_tryget_online(&memcg->css))
+		memcg = get_mem_cgroup_from_mm(mm);
+	rcu_read_unlock();
+
+	ret = charge_memcg(folio, memcg, gfp);
+	css_put(&memcg->css);
+	return ret;
+}
+#endif
 
 /*
  * mem_cgroup_swapin_uncharge_swap - uncharge swap slot

@@ -379,17 +379,24 @@ void workingset_age_nonresident(struct lruvec *lruvec, unsigned long nr_pages)
  * Return: a shadow entry to be stored in @folio->mapping->i_pages in place
  * of the evicted @folio so that a later refault can be detected.
  */
+#ifndef CONFIG_MEMCOMP
 void *workingset_eviction(struct folio *folio, struct mem_cgroup *target_memcg)
+#else
+static void *workingset_eviction_common(struct folio *folio,
+					struct mem_cgroup *target_memcg)
+#endif
 {
 	struct pglist_data *pgdat = folio_pgdat(folio);
 	unsigned long eviction;
 	struct lruvec *lruvec;
 	int memcgid;
 
+#ifndef CONFIG_MEMCOMP
 	/* Folio is fully exclusive and pins folio's memory cgroup pointer */
 	VM_BUG_ON_FOLIO(folio_test_lru(folio), folio);
 	VM_BUG_ON_FOLIO(folio_ref_count(folio), folio);
 	VM_BUG_ON_FOLIO(!folio_test_locked(folio), folio);
+#endif
 
 	if (lru_gen_enabled())
 		return lru_gen_eviction(folio);
@@ -403,6 +410,31 @@ void *workingset_eviction(struct folio *folio, struct mem_cgroup *target_memcg)
 	return pack_shadow(memcgid, pgdat, eviction,
 				folio_test_workingset(folio));
 }
+
+#ifdef CONFIG_MEMCOMP
+void *workingset_eviction(struct folio *folio, struct mem_cgroup *target_memcg)
+{
+	/* Keep the stock exclusivity contract, including its zero-ref check. */
+	VM_BUG_ON_FOLIO(folio_test_lru(folio), folio);
+	VM_BUG_ON_FOLIO(folio_ref_count(folio), folio);
+	VM_BUG_ON_FOLIO(!folio_test_locked(folio), folio);
+	return workingset_eviction_common(folio, target_memcg);
+}
+
+/*
+ * memcomp has irrevocably committed source exit. Anonymous sources are
+ * frozen; shmem still holds page-cache references while publishing its
+ * successful XA replacement. The locked, isolated folio pins folio_memcg().
+ * Caller holds no T, PTL or XA lock, and has excluded all token consumers.
+ */
+void *workingset_memcomp_eviction(struct folio *folio,
+				  struct mem_cgroup *target_memcg)
+{
+	VM_BUG_ON_FOLIO(folio_test_lru(folio), folio);
+	VM_BUG_ON_FOLIO(!folio_test_locked(folio), folio);
+	return workingset_eviction_common(folio, target_memcg);
+}
+#endif
 
 /**
  * workingset_test_recent - tests if the shadow entry is for a folio that was

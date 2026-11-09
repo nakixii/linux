@@ -101,6 +101,10 @@ mc16_swapoff_entry(struct memcomp_ref *ref, unsigned int type,
 		ret = -EIO;
 		goto out_unlock;
 	}
+	if (*mc16_shadow_ptr(ref) == MC16_SHADOW_PUBLISHING) {
+		ret = 0;
+		goto out_unlock;
+	}
 	if (mc16_flags_state(*view.flags) != MC16_SWAPPED) {
 		ret = 0;
 		goto out_unlock;

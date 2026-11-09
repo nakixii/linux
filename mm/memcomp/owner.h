@@ -3,6 +3,8 @@
 #define _MM_MEMCOMP_OWNER_H
 
 /* Include after access/refs and memcomp_state_drop_owner(). */
+#include "workingset_store.h"
+
 struct mc16_owner_tail {
 	struct mc16_record *record;
 	bool resident;
@@ -22,9 +24,8 @@ struct mc16_owner_tail {
  * anon_vma must be handed off by the producer, never put by a PTL finalizer.
  */
 static inline bool
-mc16_owner_drop_locked(struct memcomp_ref *ref, struct folio *folio,
-		       unsigned int nr_pages, unsigned int page_idx,
-		       struct mc16_owner_tail *tail)
+mc16_owner_can_drop_locked(struct memcomp_ref *ref, struct folio *folio,
+			   unsigned int nr_pages, unsigned int page_idx)
 {
 	struct mc16_swap_fields swap;
 	struct mc16_view view;
@@ -57,6 +58,51 @@ mc16_owner_drop_locked(struct memcomp_ref *ref, struct folio *folio,
 			return false;
 	}
 
+	return true;
+}
+
+/*
+ * Infallible detach after whole-span validation, PUBLISHING and folio freeze.
+ * Source OWNER + guard keep the record attached despite concurrent PTE zap.
+ * Do not use a sequence of fallible sibling drops after recording eviction.
+ */
+static inline void
+mc16_owner_detach_locked(struct memcomp_ref *ref, struct mc16_owner_tail *tail)
+{
+	struct mc16_view view;
+	u16 flags;
+
+	lockdep_assert_held(memcomp_lock_of(ref->token));
+	mc16_view_locked(ref, &view);
+	flags = *view.flags;
+	memcomp_state_drop_owner();
+	view.member->owner_folio = NULL;
+	view.member->payload_charge = 0;
+	ref->slot->word = *view.word;
+	ref->slot->length = *view.length;
+	/* Publish the detached payload before lockless SAMEFILL readers run. */
+	smp_store_release(&ref->slot->flags, flags & ~MC16_F_OWNER);
+	*tail = (struct mc16_owner_tail) { .record = view.record };
+}
+
+static inline bool
+mc16_owner_drop_locked(struct memcomp_ref *ref, struct folio *folio,
+		       unsigned int nr_pages, unsigned int page_idx,
+		       struct mc16_owner_tail *tail)
+{
+	struct mc16_view view;
+	u16 flags;
+	bool resident;
+
+	if (!mc16_owner_can_drop_locked(ref, folio, nr_pages, page_idx))
+		return false;
+	mc16_view_locked(ref, &view);
+	flags = *view.flags;
+	resident = mc16_flags_state(flags) == MC16_PENDING &&
+		   (flags & MC16_F_RESIDENT);
+	/* Rollback/invalidation never creates a workingset shadow. */
+	if (*mc16_shadow_ptr(ref) == MC16_SHADOW_PUBLISHING)
+		*mc16_shadow_ptr(ref) = 0;
 	memcomp_state_drop_owner();
 	*view.flags = flags & ~MC16_F_OWNER;
 	*tail = (struct mc16_owner_tail) { .resident = resident };

@@ -38,7 +38,7 @@ static inline bool mc16_store_cache_folio(struct folio *folio,
 		goto success;
 	}
 	src = kmap_local_folio(folio, 0);
-	ret = mc16_cache_store(src, folio, &initial);
+	ret = mc16_cache_store_prepared(src, folio, &initial);
 	kunmap_local(src);
 	if (ret)
 		goto fail_payload;
@@ -66,5 +66,29 @@ fail_arch:
 fail:
 	memcomp_debug_add(nr_pages, &memcomp_shmem_store_fail_pages);
 	return false;
+}
+
+/*
+ * The successful XA replacer borrows a guard acquired before taking XA.
+ * Cache preparation set PUBLISHING before the initial reference became
+ * selectable. That marker is never reopened by a cache reader/writer.
+ * The locked source pins its original folio_memcg until eviction completes;
+ * truncate may remove the cache owner, but cannot retire our guarded slot.
+ */
+static inline void
+mc16_publish_cache_eviction(struct folio *folio, struct memcomp_ref *ref)
+{
+	void *shadow;
+	bool prepared;
+
+	VM_WARN_ON_ONCE_FOLIO(!folio_test_locked(folio), folio);
+	mutex_lock(memcomp_lock_of(ref->token));
+	prepared = *mc16_shadow_ptr(ref) == MC16_SHADOW_PUBLISHING;
+	mutex_unlock(memcomp_lock_of(ref->token));
+	/* Idempotent: an already consumed shadow does not reopen its epoch. */
+	if (!prepared)
+		return;
+	shadow = mc16_store_eviction(folio, NULL);
+	mc16_store_publish(ref, 1, shadow);
 }
 #endif /* _MM_MEMCOMP_CACHE_FOLIO_H */

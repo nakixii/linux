@@ -70,6 +70,7 @@ static inline bool mc16_cache_pin(unsigned long token, struct memcomp_ref *ref)
  */
 static inline int mc16_cache_load(struct memcomp_ref *ref, struct folio *folio)
 {
+	struct mc16_user_read scope;
 	void *dst;
 	int ret;
 
@@ -77,9 +78,14 @@ static inline int mc16_cache_load(struct memcomp_ref *ref, struct folio *folio)
 		return -ENOENT;
 	if (!folio || folio_test_large(folio) || !folio_test_locked(folio))
 		return -EINVAL;
+	ret = mc16_user_refault(ref, 1, folio);
+	if (ret)
+		return ret;
+	mc16_user_read_start(&scope, folio);
 	dst = kmap_local_folio(folio, 0);
 	ret = mc16_load_page(ref, dst);
 	kunmap_local(dst);
+	mc16_user_read_end(&scope);
 	if (!ret) {
 		__folio_mark_uptodate(folio);
 		flush_dcache_folio(folio);

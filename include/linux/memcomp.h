@@ -8,6 +8,7 @@
 #include <linux/types.h>
 
 struct folio;
+struct mem_cgroup;
 struct mc16_slot;
 struct mc16_cluster;
 struct memcomp_async;
@@ -44,6 +45,11 @@ enum memcomp_anon_fail_event {
 #ifdef CONFIG_MEMCOMP
 
 bool memcomp_available(void);
+bool memcomp_release_folio_reclaim(struct folio *folio,
+				   struct mem_cgroup *target_memcg);
+void memcomp_publish_cache_eviction(struct folio *folio, struct memcomp_ref *ref);
+int memcomp_charge_folio(struct memcomp_ref *ref, struct folio *folio,
+			 struct mm_struct *mm, gfp_t gfp);
 #ifdef CONFIG_MEMCOMP_DEBUG_STATS
 void memcomp_count_initial_compress(void);
 void memcomp_count_normal_swap_fallback(void);

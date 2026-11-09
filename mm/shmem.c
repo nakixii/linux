@@ -853,6 +853,17 @@ static void shmem_delete_from_page_cache(struct folio *folio, void *radswap)
 	struct address_space *mapping = folio->mapping;
 	long nr = folio_nr_pages(folio);
 	int error;
+#ifdef CONFIG_MEMCOMP
+	struct memcomp_ref mc_ref = { };
+	swp_entry_t mc_entry = radix_to_swp_entry(radswap);
+
+	/*
+	 * Pin before replacing XA: a truncate may remove its new cache owner
+	 * immediately after unlock, before workingset publication below.
+	 */
+	if (is_memcomp_entry(mc_entry) && swp_offset(mc_entry))
+		BUG_ON(!memcomp_load_folio_pin(swp_offset(mc_entry), &mc_ref));
+#endif
 
 	xa_lock_irq(&mapping->i_pages);
 	error = shmem_replace_entry(mapping, folio->index, folio, radswap);
@@ -870,6 +881,13 @@ static void shmem_delete_from_page_cache(struct folio *folio, void *radswap)
 	mapping->nrpages -= nr;
 	shmem_update_stats(folio, -nr);
 	xa_unlock_irq(&mapping->i_pages);
+#ifdef CONFIG_MEMCOMP
+	if (mc_ref.slot) {
+		if (!error)
+			memcomp_publish_cache_eviction(folio, &mc_ref);
+		memcomp_load_folio_abort(&mc_ref);
+	}
+#endif
 	folio_put_refs(folio, nr);
 	BUG_ON(error);
 }
@@ -2288,79 +2306,74 @@ static int shmem_swapin_folio(struct inode *inode, pgoff_t index,
 
 		if (!shmem_confirm_swap(mapping, index, swap))
 			return -EEXIST;
-
-		if (shmem_inode_acct_blocks(inode, 1))
-			return -ENOSPC;
-
+		/* Keep the source identity stable across allocation and charge. */
+		if (token && !memcomp_load_folio_pin(token, &mc_ref))
+			return -EEXIST;
+		error = shmem_inode_acct_blocks(inode, 1);
+		if (error) {
+			error = -ENOSPC;
+			goto mc_put;
+		}
 		folio = shmem_alloc_folio(gfp, 0, info, index);
 		if (!folio) {
-			shmem_inode_unacct_blocks(inode, 1);
-			return -ENOMEM;
+			error = -ENOMEM;
+			goto mc_unacct;
 		}
 		__folio_set_locked(folio);
 		__folio_set_swapbacked(folio);
 		nr_pages = folio_nr_pages(folio);
 
-		error = mem_cgroup_charge(folio, fault_mm, gfp & GFP_RECLAIM_MASK);
-		if (error) {
-			shmem_inode_unacct_blocks(inode, nr_pages);
-			folio_unlock(folio);
-			folio_put(folio);
-			return error;
-		}
-
-		/*
-		 * Allocation and memcg charge may reclaim or wait for OOM.
-		 * Pin only after both, then recheck the page-cache entry.
-		 */
-		if (token)
-			memcomp_load_folio_pin(token, &mc_ref);
-		if ((token && !mc_ref.slot) ||
-		    !shmem_confirm_swap(mapping, index, swap)) {
-			shmem_inode_unacct_blocks(inode, nr_pages);
-			folio_unlock(folio);
-			folio_put(folio);
-			if (mc_ref.slot)
-				memcomp_load_folio_abort(&mc_ref);
-			return -EEXIST;
+		error = token ?
+			memcomp_charge_folio(&mc_ref, folio, fault_mm,
+					     gfp & GFP_RECLAIM_MASK) :
+			mem_cgroup_charge(folio, fault_mm, gfp & GFP_RECLAIM_MASK);
+		if (error)
+			goto mc_folio;
+		if (!shmem_confirm_swap(mapping, index, swap)) {
+			error = -EEXIST;
+			goto mc_folio;
 		}
 
 		error = token ? memcomp_load_folio(&mc_ref, folio) :
 			memcomp_load_folio_zero(folio);
 		if (error) {
-			shmem_inode_unacct_blocks(inode, nr_pages);
-			folio_unlock(folio);
-			folio_put(folio);
-			if (!shmem_confirm_swap(mapping, index, swap))
+			if (error == -EAGAIN ||
+			    !shmem_confirm_swap(mapping, index, swap))
 				error = -EEXIST;
-			memcomp_load_folio_abort(&mc_ref);
-			return error;
+			goto mc_folio;
+		}
+		/* Token0 is a fresh zero page, not a nonresident user load. */
+		if (token && fault_type) {
+			*fault_type |= VM_FAULT_MAJOR;
+			count_vm_event(PGMAJFAULT);
+			count_memcg_event_mm(fault_mm, PGMAJFAULT);
 		}
 
 		error = shmem_add_to_page_cache(folio, mapping, index,
 						swp_to_radix_entry(swap), gfp);
-		if (error) {
-			shmem_inode_unacct_blocks(inode, nr_pages);
-			folio_unlock(folio);
-			folio_put(folio);
-			memcomp_load_folio_abort(&mc_ref);
-			return error == -EEXIST ? -EEXIST : error;
-		}
+		if (error)
+			goto mc_folio;
 
 		shmem_recalc_inode(inode, 1, -1);
-
 		if (sgp == SGP_WRITE)
 			folio_mark_accessed(folio);
-
 		folio_mark_dirty(folio);
 		if (token)
 			memcomp_load_folio_commit(&mc_ref);
 		else
 			memcomp_invalidate_cache(0);
 		folio_add_lru(folio);
-
 		*foliop = folio;
 		return 0;
+
+mc_folio:
+		folio_unlock(folio);
+		folio_put(folio);
+mc_unacct:
+		shmem_inode_unacct_blocks(inode, 1);
+mc_put:
+		memcomp_load_folio_abort(&mc_ref);
+		return error;
 	}
 #endif
 

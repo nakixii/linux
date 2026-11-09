@@ -961,6 +961,22 @@ static void add_to_avail_list(struct swap_info_struct *si)
 	spin_unlock(&swap_avail_lock);
 }
 
+#ifdef CONFIG_MEMCOMP
+int swap_memcomp_transport_alloc(struct swap_info_struct *si)
+{
+	/* Use virtual fallback for large swap areas, just like zeromap. */
+	si->memcomp_transport = kvcalloc(BITS_TO_LONGS((unsigned long)si->max),
+					 sizeof(unsigned long), GFP_KERNEL);
+	return si->memcomp_transport ? 0 : -ENOMEM;
+}
+
+void swap_memcomp_transport_free(struct swap_info_struct *si)
+{
+	kvfree(si->memcomp_transport);
+	si->memcomp_transport = NULL;
+}
+#endif
+
 static void swap_range_free(struct swap_info_struct *si, unsigned long offset,
 			    unsigned int nr_entries)
 {
@@ -996,6 +1012,9 @@ static void swap_range_free(struct swap_info_struct *si, unsigned long offset,
 			swap_slot_free_notify(si->bdev, offset);
 		offset++;
 	}
+#ifdef CONFIG_MEMCOMP
+	swap_memcomp_transport_clear(si, begin, nr_entries);
+#endif
 	clear_shadow_from_swap_cache(si->type, begin, end);
 
 	/*
@@ -2916,6 +2935,10 @@ SYSCALL_DEFINE1(swapoff, const char __user *, specialfile)
 	p->cluster_next_cpu = NULL;
 	vfree(swap_map);
 	kvfree(zeromap);
+#ifdef CONFIG_MEMCOMP
+	/* Device users and scans have drained; SWP_USED still prevents reuse. */
+	swap_memcomp_transport_free(p);
+#endif
 	kvfree(cluster_info);
 	/* Destroy swap account information */
 	swap_cgroup_swapoff(p->type);
@@ -3526,6 +3549,13 @@ SYSCALL_DEFINE2(swapon, const char __user *, specialfile, int, swap_flags)
 		goto bad_swap_unlock_inode;
 	}
 
+#ifdef CONFIG_MEMCOMP
+	/* si->max is final; allocate before enable_swap_info publishes the device. */
+	error = swap_memcomp_transport_alloc(si);
+	if (error)
+		goto bad_swap_unlock_inode;
+#endif
+
 	if (si->bdev && bdev_stable_writes(si->bdev))
 		si->flags |= SWP_STABLE_WRITES;
 
@@ -3633,6 +3663,10 @@ bad_swap:
 	inode = NULL;
 	destroy_swap_extents(si);
 	swap_cgroup_swapoff(si->type);
+#ifdef CONFIG_MEMCOMP
+	/* Clear the pointer before flags allow alloc_swap_info to reuse this si. */
+	swap_memcomp_transport_free(si);
+#endif
 	spin_lock(&swap_lock);
 	si->swap_file = NULL;
 	si->flags = 0;
