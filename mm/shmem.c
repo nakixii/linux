@@ -1606,6 +1606,7 @@ try_memcomp:
 			 * and hand a block back that nothing released.
 			 */
 			shmem_recalc_inode(inode, 0, 1);
+			trace_android_vh_shmem_mod_swapped(folio->mapping, 1);
 			shmem_delete_from_page_cache(folio,
 						     swp_to_radix_entry(mc_entry));
 			if (folio_test_dirty(folio))
@@ -2355,6 +2356,7 @@ static int shmem_swapin_folio(struct inode *inode, pgoff_t index,
 			goto mc_folio;
 
 		shmem_recalc_inode(inode, 1, -1);
+		trace_android_vh_shmem_mod_swapped(folio->mapping, -1);
 		if (sgp == SGP_WRITE)
 			folio_mark_accessed(folio);
 		folio_mark_dirty(folio);

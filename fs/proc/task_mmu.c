@@ -964,6 +964,7 @@ static void smaps_pte_entry(pte_t *pte, unsigned long addr,
 
 					do_div(pss_delta, mapcount);
 					mss->swap_pss += pss_delta;
+					mss->swap_shared += PAGE_SIZE;
 				} else {
 					mss->swap_pss += (u64)PAGE_SIZE << PSS_SHIFT;
 				}
