@@ -10,7 +10,17 @@
  * readers and background actors, not token reference removal by PTE zap.
  * Only a source OWNER in its first PENDING epoch can open this gate.
  */
+#ifdef CONFIG_MEMCOMP_KUNIT_TEST
+#include <kunit/static_stub.h>
+static void *mc16_store_eviction(struct folio *folio,
+				 struct mem_cgroup *target_memcg)
+{
+	KUNIT_STATIC_STUB_REDIRECT(mc16_store_eviction, folio, target_memcg);
+	return workingset_memcomp_eviction(folio, target_memcg);
+}
+#else
 #define mc16_store_eviction workingset_memcomp_eviction
+#endif
 
 static inline int
 mc16_store_begin_locked(struct memcomp_ref *ref, struct folio *folio,

@@ -35,6 +35,9 @@
 #include <linux/xarray.h>
 
 #include "format.h"
+#ifdef CONFIG_MEMCOMP_KUNIT_TEST
+#include <kunit/static_stub.h>
+#endif
 
 #define MC16_CLUSTER_SHIFT	9
 #define MC16_CLUSTER_SLOTS	BIT(MC16_CLUSTER_SHIFT)
@@ -176,11 +179,17 @@ static struct {
 
 static unsigned long mc16_aging_now(void)
 {
+#ifdef CONFIG_MEMCOMP_KUNIT_TEST
+	KUNIT_STATIC_STUB_REDIRECT(mc16_aging_now);
+#endif
 	return jiffies;
 }
 
 static void mc16_queue_aging(unsigned long delay)
 {
+#ifdef CONFIG_MEMCOMP_KUNIT_TEST
+	KUNIT_STATIC_STUB_REDIRECT(mc16_queue_aging, delay);
+#endif
 	mod_delayed_work(system_unbound_wq, &mc16_retained_aging, delay);
 }
 
@@ -188,6 +197,9 @@ static void mc16_schedule_aging(void)
 {
 	unsigned long irqflags, now, delay;
 
+#ifdef CONFIG_MEMCOMP_KUNIT_TEST
+	KUNIT_STATIC_STUB_REDIRECT(mc16_schedule_aging);
+#endif
 	xa_lock_irqsave(&mc16_clusters, irqflags);
 	if (mc16_aging.requested) {
 		xa_unlock_irqrestore(&mc16_clusters, irqflags);
@@ -257,12 +269,20 @@ static inline void *mc16_kmalloc_owner(size_t bytes, gfp_t gfp,
 static inline void *mc16_owner_alloc(size_t bytes, gfp_t gfp,
 				     struct obj_cgroup *objcg)
 {
+#ifdef CONFIG_MEMCOMP_KUNIT_TEST
+	return mc16_kunit_storage_alloc(bytes, gfp, objcg);
+#else
 	return mc16_kmalloc_owner(bytes, gfp, objcg);
+#endif
 }
 
 static inline void mc16_queue_rcu(struct rcu_head *head, rcu_callback_t func)
 {
+#ifdef CONFIG_MEMCOMP_KUNIT_TEST
+	mc16_kunit_queue_rcu(head, func);
+#else
 	call_rcu(head, func);
+#endif
 }
 
 static inline void *mc16_alloc_zero(enum mc16_storage_class type,
@@ -284,16 +304,25 @@ static inline void *mc16_alloc_zero(enum mc16_storage_class type,
  */
 static inline int mc16_source_id_get(struct folio *folio, unsigned short *id)
 {
+#ifdef CONFIG_MEMCOMP_KUNIT_TEST
+	KUNIT_STATIC_STUB_REDIRECT(mc16_source_id_get, folio, id);
+#endif
 	return mem_cgroup_memcomp_id_get_checked(folio, id);
 }
 
 static inline bool mc16_owner_id_get_ref(unsigned short id)
 {
+#ifdef CONFIG_MEMCOMP_KUNIT_TEST
+	KUNIT_STATIC_STUB_REDIRECT(mc16_owner_id_get_ref, id);
+#endif
 	return mem_cgroup_memcomp_id_get_ref(id);
 }
 
 static inline void mc16_owner_id_put(unsigned short id)
 {
+#ifdef CONFIG_MEMCOMP_KUNIT_TEST
+	KUNIT_STATIC_STUB_REDIRECT(mc16_owner_id_put, id);
+#endif
 	mem_cgroup_memcomp_id_put(id);
 }
 
@@ -331,6 +360,9 @@ mc16_key_find_id(struct obj_cgroup *objcg, unsigned int nid, u8 kind,
 
 static inline int mc16_private_id_alloc(u32 *id)
 {
+#ifdef CONFIG_MEMCOMP_KUNIT_TEST
+	KUNIT_STATIC_STUB_REDIRECT(mc16_private_id_alloc, id);
+#endif
 	return __xa_alloc(&mc16_clusters, id, NULL,
 			  XA_LIMIT(1, MC16_MAX_CLUSTER_ID),
 			  GFP_NOWAIT | __GFP_NOWARN);
@@ -338,6 +370,9 @@ static inline int mc16_private_id_alloc(u32 *id)
 
 static inline struct mc16_key *mc16_key_zalloc(void)
 {
+#ifdef CONFIG_MEMCOMP_KUNIT_TEST
+	KUNIT_STATIC_STUB_REDIRECT(mc16_key_zalloc);
+#endif
 	return kzalloc(sizeof(struct mc16_key), GFP_NOIO | __GFP_NOWARN);
 }
 

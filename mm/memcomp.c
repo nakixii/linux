@@ -300,6 +300,11 @@ struct memcomp_ctx_timing_record {
 struct memcomp_direct_staging {
 	unsigned char *dst;
 	struct memcomp_ctx_timing_record timing;
+#ifdef CONFIG_MEMCOMP_KUNIT_TEST
+	int kunit_compress_preempt_count;
+	int kunit_detach_preempt_count;
+	void *kunit_compress_dst;
+#endif
 };
 
 /*
@@ -352,7 +357,32 @@ struct memcomp_store_ctx {
 	/* The span's anon_vma reference, for the caller to drop once stored. */
 	struct anon_vma *anon_vma;
 	struct mc16_zero_carrier zero;
+#ifdef CONFIG_MEMCOMP_KUNIT_TEST
+	unsigned int kunit_zs_failures;
+	int kunit_refresh_commit_error;
+	struct memcomp_kunit_async_probe *kunit_async_probe;
+#endif
 };
+
+#ifdef CONFIG_MEMCOMP_KUNIT_TEST
+/* One fixture's synchronous store call, not a production allocator ledger. */
+struct memcomp_kunit_async_probe {
+	struct task_struct *task;
+	struct folio *folio;
+	const struct memcomp_async_req *request;
+	struct zs_pool *pool;
+	unsigned long handle;
+	unsigned int allocs;
+	unsigned int frees;
+	unsigned int precomp_hits;
+	unsigned int commit_fail_hits;
+	int commit_error;
+	bool live;
+	bool bad_lifetime;
+};
+
+static struct memcomp_kunit_async_probe __rcu *memcomp_kunit_async_probe;
+#endif
 
 /*
  * Hashed payload locks.  One entry's state and payload are protected by
@@ -426,6 +456,13 @@ struct memcomp_reclaim_ctx {
 	bool borrowed;
 	bool background;
 	bool direct_staging;
+#ifdef CONFIG_MEMCOMP_KUNIT_TEST
+	int kunit_compress_error;
+	int kunit_compress_preempt_count;
+	void *kunit_compress_dst;
+	int kunit_refresh_commit_error;
+	bool *kunit_detached;
+#endif
 };
 
 enum memcomp_ctx_timing_kind {
@@ -618,6 +655,9 @@ static atomic64_t memcomp_reclaim_ctx_early_reject_pages =
 	ATOMIC64_INIT(0);
 static atomic64_t memcomp_direct_staging_miss = ATOMIC64_INIT(0);
 static atomic64_t memcomp_direct_staging_detach = ATOMIC64_INIT(0);
+#ifdef CONFIG_MEMCOMP_KUNIT_TEST
+static atomic_t memcomp_kunit_ctx_get_fail = ATOMIC_INIT(0);
+#endif
 static atomic64_t memcomp_compress_fail = ATOMIC64_INIT(0);
 static atomic64_t memcomp_zs_fast_fail = ATOMIC64_INIT(0);
 static atomic64_t memcomp_zs_retries = ATOMIC64_INIT(0);
@@ -858,19 +898,132 @@ static void memcomp_arch_restore(unsigned long token, struct folio *folio)
 
 /* "Payload can satisfy a fault without swap IO". */
 
+#ifdef CONFIG_MEMCOMP_KUNIT_TEST
+static void memcomp_kunit_async_bind(struct memcomp_store_ctx *store,
+				     struct folio *folio)
+{
+	struct memcomp_kunit_async_probe *probe;
+
+	rcu_read_lock();
+	probe = rcu_dereference(memcomp_kunit_async_probe);
+	if (probe && probe->task == current && probe->folio == folio &&
+	    probe->request == store->precomp)
+		store->kunit_async_probe = probe;
+	rcu_read_unlock();
+}
+
+static void memcomp_kunit_async_alloc(struct memcomp_store_ctx *store,
+				      struct zs_pool *pool, unsigned long handle)
+{
+	struct memcomp_kunit_async_probe *probe;
+
+	/* A bound store is synchronous in the fixture task, which owns probe. */
+	probe = store ? store->kunit_async_probe : NULL;
+	if (!probe || probe->task != current)
+		return;
+	probe->allocs++;
+	if (probe->allocs != 1) {
+		probe->bad_lifetime = true;
+		return;
+	}
+	probe->pool = pool;
+	probe->handle = handle;
+	probe->live = true;
+}
+
+static void memcomp_kunit_async_precomp(struct memcomp_store_ctx *store,
+					const struct memcomp_async_req *request)
+{
+	struct memcomp_kunit_async_probe *probe;
+
+	probe = store ? store->kunit_async_probe : NULL;
+	if (probe && probe->task == current && probe->request == request)
+		probe->precomp_hits++;
+}
+
+static void memcomp_kunit_async_free(struct zs_pool *pool, unsigned long handle)
+{
+	struct memcomp_kunit_async_probe *probe;
+
+	rcu_read_lock();
+	probe = rcu_dereference(memcomp_kunit_async_probe);
+	if (probe && probe->task == current &&
+	    probe->pool == pool && probe->handle == handle) {
+		if (!probe->live)
+			probe->bad_lifetime = true;
+		probe->frees++;
+		probe->live = false;
+	}
+	rcu_read_unlock();
+}
+#endif
+
 static void memcomp_zs_free(u8 pool_idx, unsigned long handle)
 {
 	zs_free(memcomp_pools[pool_idx], handle);
+#ifdef CONFIG_MEMCOMP_KUNIT_TEST
+	memcomp_kunit_async_free(memcomp_pools[pool_idx], handle);
+#endif
 }
+
+#if defined(CONFIG_MEMCOMP_KUNIT_TEST) && defined(CONFIG_MEMCG)
+/*
+ * An isolated owner models byte charges in KUnit.  Only this identity is
+ * intercepted; real memcgs always use the production APIs.  The test drains
+ * RCU callbacks before removing the owner so deferred frees see the model.
+ */
+struct memcomp_kunit_objcg {
+	struct obj_cgroup objcg;
+	atomic_long_t charged;
+	atomic_t charge_calls;
+	atomic_t uncharge_calls;
+	atomic_t get_calls;
+	atomic_t put_calls;
+	struct task_struct *task;
+	struct folio *folio;
+	unsigned int fail_at;
+	int error;
+};
+
+static struct memcomp_kunit_objcg __rcu *memcomp_kunit_objcg;
+#endif
 
 static struct obj_cgroup *memcomp_objcg_get(struct folio *folio)
 {
+#if defined(CONFIG_MEMCOMP_KUNIT_TEST) && defined(CONFIG_MEMCG)
+	struct memcomp_kunit_objcg *model;
+	struct obj_cgroup *objcg = NULL;
+
+	rcu_read_lock();
+	model = rcu_dereference(memcomp_kunit_objcg);
+	if (model && model->task == current && model->folio == folio) {
+		atomic_inc(&model->get_calls);
+		objcg = &model->objcg;
+	}
+	rcu_read_unlock();
+	if (objcg)
+		return objcg;
+#endif
 	return get_obj_cgroup_from_folio(folio);
 }
 
 /* Hold an additional metadata owner without bypassing the test model. */
 static __maybe_unused void memcomp_objcg_get_ref(struct obj_cgroup *objcg)
 {
+#if defined(CONFIG_MEMCOMP_KUNIT_TEST) && defined(CONFIG_MEMCG)
+	struct memcomp_kunit_objcg *model;
+	bool modeled = false;
+
+	rcu_read_lock();
+	model = rcu_dereference(memcomp_kunit_objcg);
+	if (model && objcg == &model->objcg) {
+		atomic_inc(&model->get_calls);
+		modeled = true;
+	}
+	rcu_read_unlock();
+	if (modeled)
+		return;
+#endif
 #ifdef CONFIG_MEMCG
 	if (objcg)
 		obj_cgroup_get(objcg);
@@ -879,6 +1032,20 @@ static __maybe_unused void memcomp_objcg_get_ref(struct obj_cgroup *objcg)
 
 static void memcomp_objcg_put(struct obj_cgroup *objcg)
 {
+#if defined(CONFIG_MEMCOMP_KUNIT_TEST) && defined(CONFIG_MEMCG)
+	struct memcomp_kunit_objcg *model;
+	bool modeled = false;
+
+	rcu_read_lock();
+	model = rcu_dereference(memcomp_kunit_objcg);
+	if (model && objcg == &model->objcg) {
+		atomic_inc(&model->put_calls);
+		modeled = true;
+	}
+	rcu_read_unlock();
+	if (modeled)
+		return;
+#endif
 	obj_cgroup_put(objcg);
 }
 
@@ -889,6 +1056,28 @@ static int memcomp_objcg_charge(struct obj_cgroup *objcg, gfp_t gfp,
 	if (!objcg || !size)
 		return 0;
 
+#ifdef CONFIG_MEMCOMP_KUNIT_TEST
+	{
+		struct memcomp_kunit_objcg *model;
+		bool modeled = false;
+		int ret = 0;
+
+		rcu_read_lock();
+		model = rcu_dereference(memcomp_kunit_objcg);
+		if (model && objcg == &model->objcg) {
+			int call = atomic_inc_return(&model->charge_calls);
+
+			modeled = true;
+			if (call == model->fail_at)
+				ret = model->error;
+			else
+				atomic_long_add(size, &model->charged);
+		}
+		rcu_read_unlock();
+		if (modeled)
+			return ret;
+	}
+#endif
 	return obj_cgroup_charge(objcg, gfp, size);
 #else
 	return 0;
@@ -900,6 +1089,23 @@ static void memcomp_objcg_uncharge(struct obj_cgroup *objcg, size_t size)
 #if defined(CONFIG_MEMCG)
 	if (!objcg || !size)
 		return;
+#ifdef CONFIG_MEMCOMP_KUNIT_TEST
+	{
+		struct memcomp_kunit_objcg *model;
+		bool modeled = false;
+
+		rcu_read_lock();
+		model = rcu_dereference(memcomp_kunit_objcg);
+		if (model && objcg == &model->objcg) {
+			atomic_inc(&model->uncharge_calls);
+			atomic_long_sub(size, &model->charged);
+			modeled = true;
+		}
+		rcu_read_unlock();
+		if (modeled)
+			return;
+	}
+#endif
 	obj_cgroup_uncharge(objcg, size);
 #endif
 }
@@ -907,7 +1113,15 @@ static void memcomp_objcg_uncharge(struct obj_cgroup *objcg, size_t size)
 #include "memcomp/format.h"
 #include "memcomp/zero.h"
 #include "memcomp/lifetime.h"
+#ifdef CONFIG_MEMCOMP_KUNIT_TEST
+static void *mc16_kunit_storage_alloc(size_t bytes, gfp_t gfp,
+				      struct obj_cgroup *objcg);
+static void mc16_kunit_queue_rcu(struct rcu_head *head, rcu_callback_t func);
+#endif
 #include "memcomp/storage.h"
+#ifdef CONFIG_MEMCOMP_KUNIT_TEST
+#include "memcomp/tests/storage_fixture.h"
+#endif
 
 #ifdef CONFIG_SWAP
 /* An entry owns one reference on its raw or packed backing slot. */
@@ -922,6 +1136,52 @@ static void memcomp_objcg_uncharge(struct obj_cgroup *objcg, size_t size)
  * build keeps the direct calls.
  */
 
+#ifdef CONFIG_MEMCOMP_KUNIT_TEST
+/* Fixture mode; synthetic swap tests must not access a real device. */
+static bool mc16_kunit_real_swap;
+
+static atomic_t memcomp_kunit_slot_puts = ATOMIC_INIT(0);
+static atomic_t memcomp_kunit_slot_dups = ATOMIC_INIT(0);
+
+static int memcomp_slot_dup(swp_entry_t swap)
+{
+	if (READ_ONCE(mc16_kunit_real_swap))
+		return swap_duplicate(swap);
+	if (swap.val)
+		atomic_inc(&memcomp_kunit_slot_dups);
+	return 0;
+}
+
+static void memcomp_slot_put(swp_entry_t swap)
+{
+	if (READ_ONCE(mc16_kunit_real_swap)) {
+		swap_free(swap);
+		return;
+	}
+	if (swap.val)
+		atomic_inc(&memcomp_kunit_slot_puts);
+}
+
+static atomic_t memcomp_kunit_slot_reclaims = ATOMIC_INIT(0);
+
+static void memcomp_slot_put_packed(swp_entry_t swap)
+{
+	if (READ_ONCE(mc16_kunit_real_swap)) {
+		free_swap_and_cache(swap);
+		return;
+	}
+	if (swap.val)
+		atomic_inc(&memcomp_kunit_slot_reclaims);
+}
+
+/* No device, so no count: a fault never keeps a slot's page cached. */
+static int memcomp_slot_count(swp_entry_t swap)
+{
+	if (READ_ONCE(mc16_kunit_real_swap))
+		return __swap_count(swap);
+	return 0;
+}
+#else
 static int memcomp_slot_dup(swp_entry_t swap)
 {
 	return swap_duplicate(swap);
@@ -949,6 +1209,7 @@ static int memcomp_slot_count(swp_entry_t swap)
 {
 	return __swap_count(swap);
 }
+#endif
 
 /*
  * Detach a swap-backed entry from its slot.  Caller holds the token lock
@@ -1770,6 +2031,11 @@ memcomp_direct_staging_try_get(void)
 			    memcomp_direct_staging_active);
 #endif
 		staging = &memcomp_direct_staging[idx];
+#ifdef CONFIG_MEMCOMP_KUNIT_TEST
+		staging->kunit_compress_preempt_count = -1;
+		staging->kunit_detach_preempt_count = -1;
+		staging->kunit_compress_dst = NULL;
+#endif
 	}
 	spin_unlock_irqrestore(&memcomp_direct_staging_lock, flags);
 	if (!staging)
@@ -2178,7 +2444,20 @@ memcomp_payload_zs_malloc(struct zs_pool *pool, unsigned int size,
 			  unsigned long *handle, bool allow_slow,
 			  struct memcomp_store_ctx *store)
 {
+#ifdef CONFIG_MEMCOMP_KUNIT_TEST
+	int ret;
+
+	if (store && store->kunit_zs_failures) {
+		store->kunit_zs_failures--;
+		return -ENOMEM;
+	}
+	ret = memcomp_zs_malloc(pool, size, handle, allow_slow);
+	if (!ret)
+		memcomp_kunit_async_alloc(store, pool, *handle);
+	return ret;
+#else
 	return memcomp_zs_malloc(pool, size, handle, allow_slow);
+#endif
 }
 
 static int memcomp_decompress_payload(const void *src,
@@ -2626,6 +2905,13 @@ unavailable:
 	ctx->borrowed = borrowed;
 	ctx->background = background;
 	ctx->direct_staging = false;
+#ifdef CONFIG_MEMCOMP_KUNIT_TEST
+	ctx->kunit_compress_error = 0;
+	ctx->kunit_compress_preempt_count = -1;
+	ctx->kunit_compress_dst = NULL;
+	ctx->kunit_refresh_commit_error = 0;
+	ctx->kunit_detached = NULL;
+#endif
 	return ctx;
 }
 
@@ -2657,6 +2943,15 @@ memcomp_get_comp_ctx(enum memcomp_payload_mode mode,
 
 	if (miss)
 		*miss = MEMCOMP_COMP_CTX_AVAILABLE;
+
+#ifdef CONFIG_MEMCOMP_KUNIT_TEST
+	if (atomic_dec_if_positive(&memcomp_kunit_ctx_get_fail) >= 0) {
+		if (miss)
+			*miss = MEMCOMP_COMP_CTX_ALL_BUSY;
+		memcomp_debug_inc(&memcomp_ctx_busy);
+		return NULL;
+	}
+#endif
 
 	can_retry = memcomp_can_retry_alloc();
 	background = memcomp_comp_ctx_background(mode, source, can_retry);
@@ -2721,6 +3016,13 @@ static void memcomp_put_comp_ctx(struct memcomp_reclaim_ctx *ctx)
 	ctx->borrowed = false;
 	ctx->background = false;
 	ctx->direct_staging = false;
+#ifdef CONFIG_MEMCOMP_KUNIT_TEST
+	ctx->kunit_compress_error = 0;
+	ctx->kunit_compress_preempt_count = -1;
+	ctx->kunit_compress_dst = NULL;
+	ctx->kunit_refresh_commit_error = 0;
+	ctx->kunit_detached = NULL;
+#endif
 	/*
 	 * Unlock before publishing the free bit: a claimer trylocks ctx->lock
 	 * as soon as it sees the bit, and expects the previous owner to be
@@ -2806,6 +3108,9 @@ static int memcomp_alloc_raw_payload(u8 pool_idx, const void *src,
 	dst = zs_map_object(pool, *handle, ZS_MM_WO);
 	if (!dst) {
 		zs_free(pool, *handle);
+#ifdef CONFIG_MEMCOMP_KUNIT_TEST
+		memcomp_kunit_async_free(pool, *handle);
+#endif
 		return -EIO;
 	}
 
@@ -2895,12 +3200,22 @@ memcomp_detach_reclaim_ctx(struct memcomp_reclaim_ctx **ctxp,
 	lockdep_assert_preemption_disabled();
 	lockdep_assert_held(&ctx->lock);
 	staging->timing = ctx->timing;
+#ifdef CONFIG_MEMCOMP_KUNIT_TEST
+	staging->kunit_compress_preempt_count =
+		ctx->kunit_compress_preempt_count;
+	staging->kunit_compress_dst = ctx->kunit_compress_dst;
+	if (ctx->kunit_detached)
+		*ctx->kunit_detached = true;
+#endif
 	ctx->timing.timing_active = false;
 	*ctxp = NULL;
 	memcomp_put_comp_ctx(ctx);
 	if (staging->timing.timing_active)
 		staging->timing.timing_lease_end_ns = ktime_get_ns();
 	memcomp_debug_inc(&memcomp_direct_staging_detach);
+#ifdef CONFIG_MEMCOMP_KUNIT_TEST
+	staging->kunit_detach_preempt_count = preempt_count();
+#endif
 }
 
 /*
@@ -2969,6 +3284,10 @@ memcomp_prepare_payload_locked(struct memcomp_reclaim_ctx **ctxp,
 	 */
 	if (precomp ? precomp->same_filled :
 		      page_same_filled(src, &element)) {
+#ifdef CONFIG_MEMCOMP_KUNIT_TEST
+		if (precomp)
+			memcomp_kunit_async_precomp(store, precomp);
+#endif
 		*length = 0;
 		*handle = precomp ? precomp->element : element;
 		return 0;
@@ -3006,6 +3325,13 @@ memcomp_prepare_payload_locked(struct memcomp_reclaim_ctx **ctxp,
 	if (staging)
 		preempt_disable();
 	compress_timing = memcomp_compress_timing_start(timing);
+#ifdef CONFIG_MEMCOMP_KUNIT_TEST
+	ctx->kunit_compress_preempt_count = preempt_count();
+	ctx->kunit_compress_dst = compressed;
+	ret = ctx->kunit_compress_error;
+	ctx->kunit_compress_error = 0;
+	if (!ret)
+#endif
 		ret = crypto_comp_compress(ctx->tfm, src, src_len,
 					   compressed, &dst_len);
 	ret = memcomp_compress_result(ret, &dst_len, src_len);
@@ -3088,12 +3414,20 @@ have_payload:
 	dst = zs_map_object(pool, *handle, ZS_MM_WO);
 	if (!dst) {
 		zs_free(pool, *handle);
+#ifdef CONFIG_MEMCOMP_KUNIT_TEST
+		memcomp_kunit_async_free(pool, *handle);
+#endif
 		memcomp_ctx_timing_phase_end(timing, timing_start,
 					     &timing->timing_zs_ns);
 		return -EIO;
 	}
 	memcpy(dst, compressed, dst_len);
 	zs_unmap_object(pool, *handle);
+#ifdef CONFIG_MEMCOMP_KUNIT_TEST
+	/* Observe the supplied bytes only after the real object copy. */
+	if (precomp && compressed == precomp->buf && dst_len == precomp->len)
+		memcomp_kunit_async_precomp(store, precomp);
+#endif
 	memcomp_ctx_timing_phase_end(timing, timing_start,
 				     &timing->timing_zs_ns);
 
@@ -3132,9 +3466,87 @@ static int memcomp_prepare_payload(const void *src, unsigned int src_len,
 	return ret;
 }
 
+#ifdef CONFIG_MEMCOMP_KUNIT_TEST
+enum memcomp_kunit_fail_stage {
+	MEMCOMP_KUNIT_FAIL_NONE,
+	MEMCOMP_KUNIT_FAIL_ENTRY_ALLOC,
+	MEMCOMP_KUNIT_FAIL_TOKEN_FIRST,
+	MEMCOMP_KUNIT_FAIL_TOKEN_LATER,
+	MEMCOMP_KUNIT_FAIL_ARCH_PREPARE,
+	MEMCOMP_KUNIT_FAIL_REFRESH_COMMIT,
+};
+
+struct memcomp_kunit_fail {
+	struct task_struct *task;
+	enum memcomp_kunit_fail_stage stage;
+	unsigned int remaining;
+	int error;
+};
+
+static struct memcomp_kunit_fail memcomp_kunit_fail;
+
+static void
+memcomp_kunit_fail_next(enum memcomp_kunit_fail_stage stage,
+			unsigned int nth, int error)
+{
+	WARN_ON_ONCE(READ_ONCE(memcomp_kunit_fail.task));
+	if (WARN_ON_ONCE(!nth))
+		nth = 1;
+	if (WARN_ON_ONCE(stage == MEMCOMP_KUNIT_FAIL_NONE))
+		stage = MEMCOMP_KUNIT_FAIL_ENTRY_ALLOC;
+	if (stage == MEMCOMP_KUNIT_FAIL_ENTRY_ALLOC) {
+		error = -ENOMEM;
+	} else if (stage == MEMCOMP_KUNIT_FAIL_ARCH_PREPARE) {
+		if (WARN_ON_ONCE(error >= 0))
+			error = -ENOMEM;
+	} else if (stage == MEMCOMP_KUNIT_FAIL_REFRESH_COMMIT) {
+		if (WARN_ON_ONCE(error != -EAGAIN))
+			error = -EAGAIN;
+	} else if (WARN_ON_ONCE(error != -ENOMEM && error != -EBUSY)) {
+		error = -ENOMEM;
+	}
+
+	memcomp_kunit_fail.stage = stage;
+	memcomp_kunit_fail.remaining = nth;
+	memcomp_kunit_fail.error = error;
+	WRITE_ONCE(memcomp_kunit_fail.task, current);
+}
+
+static void memcomp_kunit_fail_clear(void)
+{
+	WRITE_ONCE(memcomp_kunit_fail.task, NULL);
+	memcomp_kunit_fail.stage = MEMCOMP_KUNIT_FAIL_NONE;
+	memcomp_kunit_fail.remaining = 0;
+	memcomp_kunit_fail.error = 0;
+}
+
+static int
+memcomp_kunit_should_fail(enum memcomp_kunit_fail_stage stage)
+{
+	int error;
+
+	if (READ_ONCE(memcomp_kunit_fail.task) != current ||
+	    memcomp_kunit_fail.stage != stage)
+		return 0;
+	if (--memcomp_kunit_fail.remaining)
+		return 0;
+
+	error = memcomp_kunit_fail.error;
+	memcomp_kunit_fail_clear();
+	return error;
+}
+#endif
+
 static __always_inline int
 memcomp_arch_prepare_to_swap(struct folio *folio)
 {
+#ifdef CONFIG_MEMCOMP_KUNIT_TEST
+	int ret;
+
+	ret = memcomp_kunit_should_fail(MEMCOMP_KUNIT_FAIL_ARCH_PREPARE);
+	if (ret)
+		return ret;
+#endif
 	return arch_prepare_to_swap(folio);
 }
 
@@ -3249,11 +3661,24 @@ static void memcomp_drop_swapcache_folio(struct folio *folio, bool dirty)
 	folio_put(folio);
 }
 
+#ifdef CONFIG_MEMCOMP_KUNIT_TEST
+/*
+ * The suite builds the pool with sentinel slots; the real free-list return
+ * would log an error per sentinel against UML's absent device.
+ */
+static void memcomp_writeback_slots_release(swp_entry_t *slots,
+					    unsigned int n)
+{
+	if (READ_ONCE(mc16_kunit_real_swap))
+		swapcache_free_entries(slots, n);
+}
+#else
 static void memcomp_writeback_slots_release(swp_entry_t *slots,
 					    unsigned int n)
 {
 	swapcache_free_entries(slots, n);
 }
+#endif
 
 /* Return every prefetched slot this pass did not spend. */
 static void memcomp_writeback_slots_return(void)
@@ -3785,6 +4210,11 @@ int memcomp_swapoff(unsigned int type)
 	cancel_delayed_work_sync(&memcomp_writeback_drain_work);
 	return mc16_swapoff_walk(type, &ops);
 }
+
+#ifdef CONFIG_MEMCOMP_KUNIT_TEST
+/* Isolate index and IO edges; the walk, refs and mutex operations stay real. */
+
+#endif
 
 /*
  * Conservative defragmentation of packed slots.
@@ -4379,6 +4809,11 @@ __memcomp_store_after_unmap(struct folio *folio,
 		return false;
 
 	ctx = *ctxp;
+#ifdef CONFIG_MEMCOMP_KUNIT_TEST
+	store.kunit_refresh_commit_error = ctx->kunit_refresh_commit_error;
+	ctx->kunit_refresh_commit_error = 0;
+	memcomp_kunit_async_bind(&store, folio);
+#endif
 	memcomp_ctx_timing_store_start(&ctx->timing);
 	success = mc16_anon_store_internal(folio, ctxp, &store, &failure);
 	if (!success)
@@ -5741,3 +6176,6 @@ static int __init memcomp_sysfs_init(void)
 }
 subsys_initcall(memcomp_sysfs_init);
 #endif
+
+#include "memcomp/tests/suite.h"
+#include "memcomp/tests/codec_scope_test.h"

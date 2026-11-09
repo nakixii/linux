@@ -5,7 +5,16 @@
 #include <linux/highmem.h>
 
 /* Include after cache_store.h and memcomp_arch_prepare_to_swap(). */
+#ifdef CONFIG_MEMCOMP_KUNIT_TEST
+#include <kunit/static_stub.h>
+static int mc16_cache_folio_arch_prepare(struct folio *folio)
+{
+	KUNIT_STATIC_STUB_REDIRECT(mc16_cache_folio_arch_prepare, folio);
+	return memcomp_arch_prepare_to_swap(folio);
+}
+#else
 #define mc16_cache_folio_arch_prepare memcomp_arch_prepare_to_swap
+#endif
 
 /*
  * Caller holds the order-0 source folio lock throughout preparation and XA

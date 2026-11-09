@@ -6,6 +6,9 @@
 static inline vm_fault_t
 mc16_resident_lock_or_retry(struct folio *folio, struct vm_fault *vmf)
 {
+#ifdef CONFIG_MEMCOMP_KUNIT_TEST
+	KUNIT_STATIC_STUB_REDIRECT(mc16_resident_lock_or_retry, folio, vmf);
+#endif
 	return folio_lock_or_retry(folio, vmf);
 }
 

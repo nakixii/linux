@@ -118,7 +118,23 @@ mc16_refresh_validate(struct memcomp_ref *ref, struct folio **folio,
 
 static inline int mc16_refresh_commit_error(struct memcomp_store_ctx *store)
 {
+#ifdef CONFIG_MEMCOMP_KUNIT_TEST
+	int ret;
+
+	if (store && store->kunit_refresh_commit_error) {
+		ret = store->kunit_refresh_commit_error;
+		store->kunit_refresh_commit_error = 0;
+		return ret;
+	}
+	ret = memcomp_kunit_should_fail(MEMCOMP_KUNIT_FAIL_REFRESH_COMMIT);
+	if (ret && store && store->kunit_async_probe) {
+		store->kunit_async_probe->commit_fail_hits++;
+		store->kunit_async_probe->commit_error = ret;
+	}
+	return ret;
+#else
 	return 0;
+#endif
 }
 
 /*
