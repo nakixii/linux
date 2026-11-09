@@ -218,10 +218,12 @@ fallback_alloc:
 	folio_add_new_anon_rmap(folio, vma, start_addr, RMAP_EXCLUSIVE);
 	folio_add_lru_vma(folio, vma);
 	folio_ref_add(folio, nr_pages - 1);
-	if (nr_pages > 1)
+	if (nr_pages > 1) {
+		deferred_split_folio(folio, false);
 		set_ptes(vma->vm_mm, start_addr, install_pte, pte, nr_pages);
-	else
+	} else {
 		set_pte_at(vma->vm_mm, vmf->address, vmf->pte, pte);
+	}
 	arch_do_swap_page_nr(vma->vm_mm, vma, start_addr, pte, pte, nr_pages);
 	update_mmu_cache_range(vmf, vma, start_addr, install_pte, nr_pages);
 	folio_unlock(folio);
