@@ -18,7 +18,7 @@
 #include <linux/shmem_fs.h>
 #include <linux/hugetlb.h>
 #include <linux/pgtable.h>
-
+#include <linux/memcomp.h>
 #include <linux/uaccess.h>
 #include "swap.h"
 
@@ -49,6 +49,35 @@ static int mincore_hugetlb(pte_t *pte, unsigned long hmask, unsigned long addr,
  * and is up to date; i.e. that no page-in operation would be required
  * at this time if an application were to map and access this page.
  */
+#ifdef CONFIG_MEMCOMP
+/* The XA guard, not the unreferenced value returned by filemap, pins token. */
+static int mincore_memcomp_page(struct address_space *mapping, pgoff_t index)
+{
+	struct memcomp_ref ref = { };
+	unsigned long token;
+	void *entry;
+	bool pinned, stable;
+	int present;
+
+	xa_lock_irq(&mapping->i_pages);
+	entry = xa_load(&mapping->i_pages, index);
+	if (!is_memcomp_shadow(entry)) {
+		xa_unlock_irq(&mapping->i_pages);
+		return -EAGAIN;
+	}
+	token = memcomp_shadow_token(entry);
+	pinned = !token || memcomp_entry_get_ref(token, &ref);
+	xa_unlock_irq(&mapping->i_pages);
+
+	present = pinned && memcomp_mincore(token);
+	xa_lock_irq(&mapping->i_pages);
+	stable = xa_load(&mapping->i_pages, index) == entry;
+	xa_unlock_irq(&mapping->i_pages);
+	memcomp_entry_put_ref(&ref);
+	return stable ? present : -EAGAIN;
+}
+#endif
+
 static unsigned char mincore_page(struct address_space *mapping, pgoff_t index)
 {
 	unsigned char present = 0;
@@ -60,7 +89,21 @@ static unsigned char mincore_page(struct address_space *mapping, pgoff_t index)
 	 * any other file mapping (ie. marked !present and faulted in with
 	 * tmpfs's .fault). So swapped out tmpfs mappings are tested here.
 	 */
+#ifdef CONFIG_MEMCOMP
+again:
+#endif
 	folio = filemap_get_incore_folio(mapping, index);
+#ifdef CONFIG_MEMCOMP
+	if (folio == ERR_PTR(-EEXIST)) {
+		int ret = mincore_memcomp_page(mapping, index);
+
+		if (ret < 0) {
+			cond_resched();
+			goto again;
+		}
+		return ret;
+	}
+#endif
 	if (!IS_ERR(folio)) {
 		present = folio_test_uptodate(folio);
 		folio_put(folio);
@@ -97,6 +140,41 @@ static int mincore_unmapped_range(unsigned long addr, unsigned long end,
 	return 0;
 }
 
+#ifdef CONFIG_MEMCOMP
+/* Enter with PTL held; return with a fresh mapping, or NULL for ACTION_AGAIN. */
+static int mincore_memcomp_pte(pmd_t *pmd, unsigned long addr,
+			       struct mm_walk *walk, pte_t orig,
+			       pte_t **ptepp, spinlock_t **ptlp)
+{
+	struct memcomp_ref ref = { };
+	bool compressed = is_swap_pte(orig) &&
+		is_memcomp_entry(pte_to_swp_entry(orig));
+	unsigned long token = compressed ? swp_offset(pte_to_swp_entry(orig)) : 0;
+	bool pinned = true, stable;
+	unsigned char present = 0;
+
+	if (compressed && token)
+		pinned = memcomp_entry_get_ref(token, &ref);
+	pte_unmap_unlock(*ptepp, *ptlp);
+	if (compressed)
+		present = pinned && memcomp_mincore(token);
+	else
+		__mincore_unmapped_range(addr, addr + PAGE_SIZE, walk->vma, &present);
+
+	*ptepp = pte_offset_map_lock(walk->mm, pmd, addr, ptlp);
+	stable = *ptepp && pte_same(ptep_get(*ptepp), orig);
+	if (*ptepp)
+		pte_unmap_unlock(*ptepp, *ptlp);
+	/* A changed PTE may have dropped the last owner: put outside PTL. */
+	memcomp_entry_put_ref(&ref);
+	if (!*ptepp)
+		return -EAGAIN;
+	/* The first validation is the snapshot; do not retain a stale ptep. */
+	*ptepp = pte_offset_map_lock(walk->mm, pmd, addr, ptlp);
+	return stable ? present : -EAGAIN;
+}
+#endif
+
 static int mincore_pte_range(pmd_t *pmd, unsigned long addr, unsigned long end,
 			struct mm_walk *walk)
 {
@@ -119,7 +197,28 @@ static int mincore_pte_range(pmd_t *pmd, unsigned long addr, unsigned long end,
 		return 0;
 	}
 	for (; addr != end; ptep++, addr += PAGE_SIZE) {
+#ifdef CONFIG_MEMCOMP
+again:
+		;
+#endif
 		pte_t pte = ptep_get(ptep);
+
+#ifdef CONFIG_MEMCOMP
+		if ((is_swap_pte(pte) && is_memcomp_entry(pte_to_swp_entry(pte))) ||
+		    (pte_none_mostly(pte) && vma->vm_file &&
+		     shmem_mapping(vma->vm_file->f_mapping))) {
+			int ret = mincore_memcomp_pte(pmd, addr, walk, pte, &ptep, &ptl);
+
+			if (!ptep) {
+				walk->action = ACTION_AGAIN;
+				return 0;
+			}
+			if (ret < 0)
+				goto again;
+			*vec = ret;
+			goto next;
+		}
+#endif
 
 		/* We need to do cache lookup too for pte markers */
 		if (pte_none_mostly(pte))
@@ -146,6 +245,9 @@ static int mincore_pte_range(pmd_t *pmd, unsigned long addr, unsigned long end,
 #endif
 			}
 		}
+#ifdef CONFIG_MEMCOMP
+next:
+#endif
 		vec++;
 	}
 	pte_unmap_unlock(ptep - 1, ptl);

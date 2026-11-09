@@ -39,6 +39,11 @@ void memcomp_invalidate_cache(unsigned long token)
 	mc16_cache_drop(token);
 }
 
+bool memcomp_mincore(unsigned long token)
+{
+	return mc16_mincore(token);
+}
+
 bool memcomp_entry_present(unsigned long token)
 {
 	return mc16_entry_present(token);
