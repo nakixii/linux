@@ -1697,6 +1697,8 @@ void folio_remove_rmap_pmd(struct folio *folio, struct page *page,
 #endif
 }
 
+#include "memcomp_rmap.h"
+
 /*
  * @arg: enum ttu_flags will be passed to this argument
  */
@@ -1778,6 +1780,18 @@ static bool try_to_unmap_one(struct folio *folio, struct vm_area_struct *vma,
 
 		/* Unexpected PMD-mapped THP? */
 		VM_BUG_ON_FOLIO(!pvmw.pte, folio);
+#ifdef CONFIG_MEMCOMP
+		{
+			int nr = memcomp_unmap_ptes(&pvmw, folio, vma, flags);
+
+			/* Keep the ACK completion hook on the current mapping. */
+			address = pvmw.address;
+			if (nr < 0)
+				goto walk_abort;
+			if (nr > 1)
+				continue;
+		}
+#endif
 
 		pfn = pte_pfn(ptep_get(pvmw.pte));
 		subpage = folio_page(folio, pfn - folio_pfn(folio));
