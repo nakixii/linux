@@ -57,6 +57,9 @@
 #include <linux/rculist_nulls.h>
 #include <linux/random.h>
 #include <linux/mmu_notifier.h>
+#ifdef CONFIG_MEMCOMP
+#include <linux/memcomp.h>
+#endif
 
 #include <asm/tlbflush.h>
 #include <asm/div64.h>
@@ -70,6 +73,12 @@
 
 #define CREATE_TRACE_POINTS
 #include <trace/events/vmscan.h>
+#ifdef CONFIG_MEMCOMP
+
+static inline int is_page_cache_freeable(struct folio *folio);
+static void handle_write_error(struct address_space *mapping,
+			       struct folio *folio, int error);
+#endif
 
 #undef CREATE_TRACE_POINTS
 #include <trace/hooks/vmscan.h>
@@ -195,6 +204,69 @@ struct scan_control {
 	ANDROID_VENDOR_DATA(1);
 	ANDROID_OEM_DATA(1);
 };
+
+#ifdef CONFIG_MEMCOMP
+
+static bool memcomp_fresh_reservation(struct folio *folio)
+{
+	return memcomp_reserve_eligible(folio) &&
+	       !folio_memcomp_reserved(folio);
+}
+
+static bool
+memcomp_precheck_fresh_ctx(struct folio *folio, unsigned int nr_pages,
+			   enum memcomp_reclaim_source source)
+{
+	if (!memcomp_fresh_reservation(folio))
+		return true;
+
+	return memcomp_reclaim_ctx_precheck(nr_pages, source);
+}
+
+static void memcomp_count_unmap_fail(unsigned int nr_pages)
+{
+	memcomp_count_anon_fail(MEMCOMP_ANON_UNMAP_FAIL, nr_pages);
+}
+
+static void memcomp_count_finish_fail(unsigned int nr_pages)
+{
+	memcomp_count_anon_fail(MEMCOMP_ANON_FINISH_FAIL, nr_pages);
+}
+
+static void memcomp_count_incompressible_skip(unsigned int nr_pages)
+{
+	memcomp_count_anon_fail(MEMCOMP_ANON_INCOMPRESSIBLE_SKIP,
+				nr_pages);
+}
+
+/*
+ * Reclaim stored the locked @folio but keeps it after all, normally because
+ * someone else holds a reference.  Whoever drops that reference last frees
+ * the folio with nothing to release its span, which would leave the entries
+ * owned by a folio that is gone, so drop its hold on them now.  Its PTEs
+ * already name the stored payloads; reclaimed again, it is stored afresh.
+ */
+static void memcomp_finish_fail(struct folio *folio,
+				unsigned int nr_pages)
+{
+	memcomp_count_finish_fail(nr_pages);
+	memcomp_invalidate_folio(folio);
+}
+
+static bool
+memcomp_swap_permitted(bool may_swap, unsigned long nr_swap,
+		       gfp_t gfp_mask)
+{
+	return may_swap && nr_swap && (gfp_mask & __GFP_IO);
+}
+
+/* A memcomp fallback must obey the same reclaim permission as swap. */
+static bool memcomp_can_swap(struct scan_control *sc)
+{
+	return memcomp_swap_permitted(sc->may_swap, total_swap_pages,
+					 sc->gfp_mask);
+}
+#endif
 
 #ifdef ARCH_HAS_PREFETCHW
 #define prefetchw_prev_lru_folio(_folio, _base, _field)			\
@@ -352,6 +424,11 @@ static inline bool can_reclaim_anon_pages(struct mem_cgroup *memcg,
 					  int nid,
 					  struct scan_control *sc)
 {
+#ifdef CONFIG_MEMCOMP
+	if (memcomp_available())
+		return true;
+
+#endif
 	if (memcg == NULL) {
 		/*
 		 * For non-memcg reclaim, is there
@@ -1136,11 +1213,19 @@ retry:
 	while (!list_empty(folio_list)) {
 		struct address_space *mapping;
 		struct folio *folio;
+#ifdef CONFIG_MEMCOMP
+		struct memcomp_reclaim_ctx *memcomp_ctx = NULL;
+		enum memcomp_reclaim_source memcomp_source;
+#endif
 		enum folio_references references = FOLIOREF_RECLAIM;
 		bool dirty, writeback;
 		unsigned int nr_pages;
 		bool activate = false;
 		bool keep = false;
+#ifdef CONFIG_MEMCOMP
+		bool memcomp_reserved = false;
+		bool memcomp_stored = false;
+#endif
 
 		cond_resched();
 
@@ -1308,9 +1393,108 @@ retry:
 		 * Lazyfree folio could be freed directly
 		 */
 		if (folio_test_anon(folio) && folio_test_swapbacked(folio)) {
+#ifdef CONFIG_MEMCOMP
+			/* New dirty contents must get another compression attempt. */
+			if (memcomp_available() && folio_test_swapcache(folio) &&
+			    !folio_test_writeback(folio) && memcomp_folio_dirty(folio))
+				folio_free_swap(folio);
+#endif
 			if (!folio_test_swapcache(folio)) {
+#ifdef CONFIG_MEMCOMP
+				bool memcomp_attempted = false;
+				bool swap_attempted = false;
+
+				if (memcomp_available()) {
+					memcomp_count_initial_compress();
+					goto memcomp_try;
+				}
+				if (!memcomp_can_swap(sc))
+#else
 				if (!(sc->gfp_mask & __GFP_IO))
+#endif
 					goto keep_locked;
+#ifdef CONFIG_MEMCOMP
+				goto swap_try;
+
+memcomp_try:
+				memcomp_attempted = true;
+				if (nr_pages > 1 && !folio_test_large(folio)) {
+					sc->nr_scanned -= nr_pages - 1;
+					nr_pages = 1;
+				}
+				if (folio_maybe_dma_pinned(folio))
+					goto keep_locked;
+				/*
+				 * It did not compress last time and has not
+				 * changed: swap it if there is swap, rather than
+				 * compress it again for nothing, and otherwise
+				 * leave it be.
+				 */
+				if (memcomp_folio_incompressible(folio)) {
+					memcomp_count_incompressible_skip(nr_pages);
+					goto memcomp_fallback_swap;
+				}
+				if (folio_test_large(folio)) {
+					/* cannot split folio, skip it */
+					if (!can_split_folio(folio, 1, NULL))
+						goto activate_locked;
+					/*
+					 * Split partially mapped folios right away.
+					 * We can free the unmapped pages without IO.
+					 */
+					if (data_race(!list_empty(&folio->_deferred_list) &&
+						      folio_test_partially_mapped(folio)) &&
+					    split_folio_to_list(folio, folio_list))
+						goto activate_locked;
+					if (nr_pages > 1 && !folio_test_large(folio)) {
+						sc->nr_scanned -= nr_pages - 1;
+						nr_pages = 1;
+					}
+				}
+				memcomp_source = current_is_kswapd() ?
+					MEMCOMP_RECLAIM_KSWAPD :
+					MEMCOMP_RECLAIM_DIRECT;
+				if (!memcomp_precheck_fresh_ctx(folio, nr_pages,
+								memcomp_source))
+					goto memcomp_fallback_swap;
+				if (!memcomp_reserve(folio))
+					goto memcomp_fallback_swap;
+				memcomp_reserved = true;
+				memcomp_ctx = memcomp_reclaim_ctx_get(nr_pages,
+								      memcomp_source);
+				if (!memcomp_ctx) {
+					memcomp_rollback_folio(folio);
+					memcomp_reserved = false;
+					goto memcomp_fallback_swap;
+				}
+				goto anon_backing_ready;
+
+memcomp_fallback_swap:
+				/*
+				 * This is ordinary VM forward-progress fallback before
+				 * memcomp owns post-unmap tokens.  Policy writeback of
+				 * an owned payload is handled only by packed-swap reclaim.
+				 * No rollback leaves a span in folio->swap for
+				 * add_to_swap() to overwrite, only maybe a mark.
+				 */
+				if (WARN_ON_ONCE(folio_memcomp_reserved(folio)))
+					goto activate_locked;
+				if (!swap_attempted && memcomp_can_swap(sc)) {
+					memcomp_count_normal_swap_fallback();
+					goto swap_try;
+				}
+				goto activate_locked;
+
+swap_try:
+				swap_attempted = true;
+				if (!memcomp_can_swap(sc))
+					goto keep_locked;
+				if (get_nr_swap_pages() <= 0 &&
+				    memcomp_available() && !memcomp_attempted) {
+					memcomp_count_initial_compress();
+					goto memcomp_try;
+				}
+#endif
 				if (folio_maybe_dma_pinned(folio))
 					goto keep_locked;
 				if (folio_test_large(folio)) {
@@ -1330,6 +1514,13 @@ retry:
 					int __maybe_unused order = folio_order(folio);
 					bool bypass = false;
 
+#ifdef CONFIG_MEMCOMP
+					if (!memcomp_attempted &&
+					    memcomp_available()) {
+						memcomp_count_initial_compress();
+						goto memcomp_try;
+					}
+#endif
 					if (!folio_test_large(folio))
 						goto activate_locked_split;
 					trace_android_vh_split_large_folio_bypass(&bypass);
@@ -1349,6 +1540,10 @@ retry:
 					if (!add_to_swap(folio))
 						goto activate_locked_split;
 				}
+#ifdef CONFIG_MEMCOMP
+anon_backing_ready:
+				;
+#endif
 			}
 		}
 
@@ -1361,7 +1556,6 @@ retry:
 			sc->nr_scanned -= (nr_pages - 1);
 			nr_pages = 1;
 		}
-
 		/*
 		 * The folio is mapped into the page tables of one or more
 		 * processes. Try to unmap it here.
@@ -1393,8 +1587,65 @@ retry:
 				if (!was_swapbacked &&
 				    folio_test_swapbacked(folio))
 					stat->nr_lazyfree_fail += nr_pages;
+#ifdef CONFIG_MEMCOMP
+				if (memcomp_reserved) {
+					memcomp_count_unmap_fail(nr_pages);
+					memcomp_reclaim_ctx_put(memcomp_ctx);
+					memcomp_ctx = NULL;
+					memcomp_rollback_folio(folio);
+					memcomp_reserved = false;
+				}
+#endif
 				goto activate_locked;
 			}
+#ifdef CONFIG_MEMCOMP
+			if (memcomp_reserved) {
+				try_to_unmap_flush();
+				if (folio_mapped(folio)) {
+					memcomp_count_unmap_fail(nr_pages);
+					memcomp_reclaim_ctx_put(memcomp_ctx);
+					memcomp_ctx = NULL;
+					memcomp_rollback_folio(folio);
+					memcomp_reserved = false;
+					goto activate_locked;
+				}
+				if (!memcomp_store_after_unmap(folio,
+							       &memcomp_ctx)) {
+					memcomp_rollback_folio(folio);
+					memcomp_reserved = false;
+					goto activate_locked;
+				}
+				memcomp_stored = true;
+				if (folio_test_dirty(folio))
+					folio_clear_dirty(folio);
+				memcomp_reserved = false;
+			}
+		}
+
+		if (memcomp_reserved && !memcomp_stored &&
+		    !folio_mapped(folio)) {
+			try_to_unmap_flush();
+			if (folio_mapped(folio)) {
+				memcomp_count_unmap_fail(nr_pages);
+				memcomp_reclaim_ctx_put(memcomp_ctx);
+				memcomp_ctx = NULL;
+				memcomp_rollback_folio(folio);
+				memcomp_reserved = false;
+				goto activate_locked;
+			}
+			if (!memcomp_store_after_unmap(folio,
+						       &memcomp_ctx)) {
+				memcomp_rollback_folio(folio);
+				memcomp_reserved = false;
+				goto activate_locked;
+			}
+			memcomp_stored = true;
+		}
+		if (memcomp_reserved) {
+			if (folio_test_dirty(folio))
+				folio_clear_dirty(folio);
+			memcomp_reserved = false;
+#endif
 		}
 
 		/*
@@ -1450,7 +1701,15 @@ retry:
 			 * starts and then write it out here.
 			 */
 			try_to_unmap_flush_dirty();
+#ifdef CONFIG_MEMCOMP
+			{
+				pageout_t pout;
+
+				pout = pageout(folio, mapping, &plug, folio_list);
+				switch (pout) {
+#else
 			switch (pageout(folio, mapping, &plug, folio_list)) {
+#endif
 			case PAGE_KEEP:
 				goto keep_locked;
 			case PAGE_ACTIVATE:
@@ -1489,6 +1748,9 @@ retry:
 				fallthrough;
 			case PAGE_CLEAN:
 				; /* try to free the folio below */
+#ifdef CONFIG_MEMCOMP
+				}
+#endif
 			}
 		}
 
@@ -1551,8 +1813,16 @@ retry:
 			count_vm_events(PGLAZYFREED, nr_pages);
 			count_memcg_folio_events(folio, PGLAZYFREED, nr_pages);
 		} else if (!mapping || !__remove_mapping(mapping, folio, true,
+#ifdef CONFIG_MEMCOMP
+							 sc->target_mem_cgroup)) {
+			if (mapping || !memcomp_release_folio(folio))
+#else
 							 sc->target_mem_cgroup))
+#endif
 			goto keep_locked;
+#ifdef CONFIG_MEMCOMP
+		}
+#endif
 
 		folio_unlock(folio);
 free_it:
@@ -1580,6 +1850,10 @@ activate_locked_split:
 			nr_pages = 1;
 		}
 activate_locked:
+#ifdef CONFIG_MEMCOMP
+		memcomp_reclaim_ctx_put(memcomp_ctx);
+		memcomp_ctx = NULL;
+#endif
 		/* Not a candidate for swapping, so reclaim swap space. */
 		if (folio_test_swapcache(folio) &&
 		    (mem_cgroup_swap_full(folio) || folio_test_mlocked(folio)))
@@ -1592,14 +1866,28 @@ activate_locked:
 			count_memcg_folio_events(folio, PGACTIVATE, nr_pages);
 		}
 keep_locked:
+#ifdef CONFIG_MEMCOMP
+		memcomp_reclaim_ctx_put(memcomp_ctx);
+		memcomp_ctx = NULL;
+		if (memcomp_stored) {
+			memcomp_finish_fail(folio, nr_pages);
+			memcomp_stored = false;
+		}
+#endif
 		folio_unlock(folio);
 keep:
+#ifdef CONFIG_MEMCOMP
+		/*
+		 * A folio stored above is neither dirty nor in need of
+		 * release, so it only leaves through keep_locked.
+		 */
+		VM_WARN_ON_ONCE_FOLIO(memcomp_stored, folio);
+#endif
 		list_add(&folio->lru, &ret_folios);
 		VM_BUG_ON_FOLIO(folio_test_lru(folio) ||
 				folio_test_unevictable(folio), folio);
 	}
 	/* 'folio_list' is always empty here */
-
 	/* Migrate folios selected for demotion */
 	nr_demoted = demote_folio_list(&demote_folios, pgdat);
 	nr_reclaimed += nr_demoted;
@@ -2514,8 +2802,14 @@ static void get_scan_count(struct lruvec *lruvec, struct scan_control *sc,
 	enum lru_list lru;
 	bool balance_anon_file_reclaim = false;
 
+#ifdef CONFIG_MEMCOMP
+	/* If we have no swap/memcomp backing, do not scan anon folios. */
+	if ((!sc->may_swap && !memcomp_available()) ||
+	    !can_reclaim_anon_pages(memcg, pgdat->node_id, sc)) {
+#else
 	/* If we have no swap space, do not bother scanning anon folios. */
 	if (!sc->may_swap || !can_reclaim_anon_pages(memcg, pgdat->node_id, sc)) {
+#endif
 		scan_balance = SCAN_FILE;
 		goto out;
 	}
@@ -2716,6 +3010,11 @@ static bool can_age_anon_pages(struct pglist_data *pgdat,
 	if (total_swap_pages > 0)
 		return true;
 
+#ifdef CONFIG_MEMCOMP
+	if (memcomp_available())
+		return true;
+
+#endif
 	/* Also valuable if anon pages can be demoted: */
 	return can_demote(pgdat->node_id, sc);
 }
@@ -2793,11 +3092,21 @@ static int get_swappiness(struct lruvec *lruvec, struct scan_control *sc)
 	struct mem_cgroup *memcg = lruvec_memcg(lruvec);
 	struct pglist_data *pgdat = lruvec_pgdat(lruvec);
 
+#ifdef CONFIG_MEMCOMP
+	if (!sc->may_swap && !memcomp_available())
+#else
 	if (!sc->may_swap)
+#endif
 		return 0;
 
+#ifdef CONFIG_MEMCOMP
+	if (!memcomp_available() &&
+	    !can_demote(pgdat->node_id, sc) &&
+	    mem_cgroup_get_nr_swap_pages(memcg) < MIN_LRU_BATCH)
+#else
 	if (!can_demote(pgdat->node_id, sc) &&
 	    mem_cgroup_get_nr_swap_pages(memcg) < MIN_LRU_BATCH)
+#endif
 		return 0;
 
 	swappiness = sc_swappiness(sc, memcg);

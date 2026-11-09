@@ -170,6 +170,61 @@ config ZSWAP_ZPOOL_DEFAULT
        default "zsmalloc" if ZSWAP_ZPOOL_DEFAULT_ZSMALLOC
        default ""
 
+config MEMCOMP
+	bool "Compress reclaimed pages in memory (memcomp)"
+	#
+	# SWAP: memcomp installs swap PTEs of its own type and uses the
+	# generic swap-entry encoding and page-table helpers.
+	#
+	# ZRAM=n: !ZRAM also permits ZRAM=m for this bool, so require it off.
+	#
+	# zsmalloc is selected below because memcomp is built-in code and needs
+	# its allocator available in the same kernel.
+	#
+	# 64BIT: two independent 64-bit assumptions.  Tokens are u32 and
+	# allocated across the whole range, but a 32-bit swp_offset carries
+	# only BITS_PER_XA_VALUE - MAX_SWAPFILES_SHIFT = 26 bits, so a token
+	# past 64M could not round-trip through a PTE.  And the load and
+	# refresh paths map a multi-page folio with kmap_local_folio(folio, 0)
+	# and then address nr_pages * PAGE_SIZE through it, which is only the
+	# whole folio because a 64-bit kernel has no highmem.
+	#
+	depends on MMU && 64BIT && CRYPTO && SWAP && ZRAM=n && !ZSWAP
+	select ZSMALLOC
+	select CRYPTO_ACOMP
+	select XXHASH
+	default n
+	help
+	  Enable direct in-memory compression for reclaimed anonymous pages.
+
+	  Pages are compressed into RAM and mapped through a special
+	  non-swap PTE entry type. This does not require swap block I/O as
+	  the first storage layer.
+
+	  If unsure, say N.
+
+config MEMCOMP_DEFAULT_COMPRESSOR
+	string "Default memcomp compressor"
+	depends on MEMCOMP
+	default "zstd"
+	help
+	  The crypto compression algorithm memcomp uses unless
+	  memcomp.compressor= names another. If the selected algorithm is
+	  unavailable, memcomp waits up to 10 seconds from initialization
+	  for registration before trying zstd. Setup failures also fall back
+	  to zstd. Memcomp stays disabled if neither can be set up.
+
+config MEMCOMP_DEBUG_STATS
+	bool "Debug statistics for memcomp"
+	depends on MEMCOMP
+	default n
+	help
+	  Collect and export memcomp debug counters beyond the core
+	  stat and compressor attributes.
+
+	  These counters add hot-path accounting and are intended for
+	  diagnosis and tuning.  If unsure, say N.
+
 config ZBUD
 	tristate "2:1 compression allocator (zbud)"
 	depends on ZSWAP

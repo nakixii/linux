@@ -16,6 +16,7 @@
 #include <linux/swap.h>
 #include <linux/sched/mm.h>
 #include <linux/swapops.h>
+#include <linux/memcomp.h>
 #include <linux/mmu_notifier.h>
 #include <linux/page_idle.h>
 #include <linux/page_size_compat.h>
@@ -951,7 +952,26 @@ static void smaps_pte_entry(pte_t *pte, unsigned long addr,
 	} else if (is_swap_pte(ptent)) {
 		swp_entry_t swpent = pte_to_swp_entry(ptent);
 
+#ifdef CONFIG_MEMCOMP
+		if (is_memcomp_entry(swpent)) {
+			int mapcount;
+
+			if (memcomp_entry_stat(swp_offset(swpent),
+					       NULL, &mapcount)) {
+				mss->swap += PAGE_SIZE;
+				if (mapcount >= 2) {
+					u64 pss_delta = (u64)PAGE_SIZE << PSS_SHIFT;
+
+					do_div(pss_delta, mapcount);
+					mss->swap_pss += pss_delta;
+				} else {
+					mss->swap_pss += (u64)PAGE_SIZE << PSS_SHIFT;
+				}
+			}
+		} else if (!non_swap_entry(swpent)) {
+#else
 		if (!non_swap_entry(swpent)) {
+#endif
 			int mapcount;
 
 			mss->swap += PAGE_SIZE;

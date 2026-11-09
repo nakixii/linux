@@ -18,11 +18,87 @@
 #include <linux/swapops.h>
 #include <linux/swap_cgroup.h>
 #include <linux/tracepoint-defs.h>
+#include <linux/xxhash.h>
 
 /* Internal core VMA manipulation functions. */
 #include "vma.h"
 
 struct folio_batch;
+
+#ifdef CONFIG_MEMCOMP
+unsigned int memcomp_pte_batch(pte_t *start_pte, unsigned int max_nr);
+#else
+static inline unsigned int memcomp_pte_batch(pte_t *start_pte,
+					     unsigned int max_nr)
+{
+	return 0;
+}
+#endif
+
+/*
+ * Outside the swap cache, folio->swap of an anonymous folio is memcomp's:
+ * it names the first token of the span reclaim reserved for the folio, if
+ * any.  Tokens are 32-bit, so an offset with MEMCOMP_INCOMPRESSIBLE set
+ * is never one.  That bit, and a hash of the contents below it, mark a folio
+ * whose contents did not compress, so that reclaim stops compressing them
+ * while they hash the same.  The mark goes when the folio is reserved again,
+ * added to the swap cache or freed, and migration carries it over with the
+ * contents.  A split leaves it on the first page, where it no longer matches.
+ */
+#define MEMCOMP_INCOMPRESSIBLE	BIT_ULL(32)
+
+static inline bool memcomp_entry_is_mark(swp_entry_t entry)
+{
+	return is_memcomp_entry(entry) &&
+	       (swp_offset(entry) & MEMCOMP_INCOMPRESSIBLE);
+}
+
+/* Whether folio->swap names a span reclaim holds for the anonymous @folio. */
+static inline bool folio_memcomp_reserved(struct folio *folio)
+{
+	return is_memcomp_entry(folio->swap) &&
+	       !memcomp_entry_is_mark(folio->swap);
+}
+
+/* Not a file folio's private, which may look like a mark. */
+static inline bool folio_test_incompressible(struct folio *folio)
+{
+	return folio_test_anon(folio) &&
+	       memcomp_entry_is_mark(folio->swap);
+}
+
+/* @folio is locked and holds no reservation. */
+static inline void folio_set_incompressible(struct folio *folio, u32 hash)
+{
+	VM_WARN_ON_ONCE_FOLIO(!folio_test_anon(folio) ||
+			      folio_test_swapcache(folio), folio);
+	folio->swap = make_memcomp_entry(MEMCOMP_INCOMPRESSIBLE | hash);
+}
+
+/*
+ * The contents of the locked @folio, hashed for the mark.  The length goes
+ * into the hash, so the first page of a split folio no longer matches.
+ */
+static inline u32 memcomp_folio_hash(struct folio *folio)
+{
+	void *src = kmap_local_folio(folio, 0);
+	u32 hash;
+
+	hash = xxh64(src, folio_size(folio), 0);
+	kunmap_local(src);
+	return hash;
+}
+
+static inline u32 folio_incompressible_hash(struct folio *folio)
+{
+	return (u32)swp_offset(folio->swap);
+}
+
+static inline void folio_clear_incompressible(struct folio *folio)
+{
+	VM_WARN_ON_ONCE_FOLIO(!folio_test_incompressible(folio), folio);
+	folio->swap.val = 0;
+}
 
 /*
  * The set of flags that only affect watermark checking and reclaim
@@ -701,6 +777,14 @@ static inline bool folio_unqueue_deferred_split(struct folio *folio)
 
 	return __folio_unqueue_deferred_split(folio);
 }
+
+#ifdef CONFIG_TRANSPARENT_HUGEPAGE
+void deferred_split_folio_remapped(struct folio *folio);
+#else
+static inline void deferred_split_folio_remapped(struct folio *folio)
+{
+}
+#endif
 
 static inline struct folio *page_rmappable_folio(struct page *page)
 {

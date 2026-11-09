@@ -3365,6 +3365,16 @@
 			[KNL,SH] Allow user to override the default size for
 			per-device physically contiguous DMA buffers.
 
+	memcomp.compressor=
+			[KNL] Set the crypto compression algorithm used by
+			CONFIG_MEMCOMP. The default is
+			CONFIG_MEMCOMP_DEFAULT_COMPRESSOR. memcomp
+			waits up to ten seconds for an algorithm that is not
+			registered by late_initcall; if it does not appear,
+			or memcomp cannot be set up on it, memcomp
+			falls back to "zstd", and is disabled if that
+			fails too.
+
 	memhp_default_state=online/offline/online_kernel/online_movable
 			[KNL] Set the initial state for the memory hotplug
 			onlining policy. If not specified, the default value is
