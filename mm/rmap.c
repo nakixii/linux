@@ -834,6 +834,7 @@ out:
 struct folio_referenced_arg {
 	int mapcount;
 	int referenced;
+	bool any;	/* stop at the first mapping that referenced it */
 	unsigned long vm_flags;
 	struct mem_cgroup *memcg;
 };
@@ -937,7 +938,7 @@ static bool folio_referenced_one(struct folio *folio,
 		pra->vm_flags |= vma->vm_flags & ~VM_LOCKED;
 	}
 
-	if (!pra->mapcount)
+	if (!pra->mapcount || (pra->any && pra->referenced))
 		return false; /* To break the loop */
 
 	return true;
@@ -967,24 +968,14 @@ static bool invalid_folio_referenced_vma(struct vm_area_struct *vma, void *arg)
 	return false;
 }
 
-/**
- * folio_referenced() - Test if the folio was referenced.
- * @folio: The folio to test.
- * @is_locked: Caller holds lock on the folio.
- * @memcg: target memory cgroup
- * @vm_flags: A combination of all the vma->vm_flags which referenced the folio.
- *
- * Quick test_and_clear_referenced for all mappings of a folio,
- *
- * Return: The number of mappings which referenced the folio. Return -1 if
- * the function bailed out due to rmap lock contention.
- */
-int folio_referenced(struct folio *folio, int is_locked,
-		     struct mem_cgroup *memcg, unsigned long *vm_flags)
+static int __folio_referenced(struct folio *folio, int is_locked,
+			      struct mem_cgroup *memcg,
+			      unsigned long *vm_flags, bool any)
 {
 	bool we_locked = false;
 	struct folio_referenced_arg pra = {
 		.mapcount = folio_mapcount(folio),
+		.any = any,
 		.memcg = memcg,
 	};
 	struct rmap_walk_control rwc = {
@@ -1016,7 +1007,47 @@ int folio_referenced(struct folio *folio, int is_locked,
 
 	return rwc.contended ? -1 : pra.referenced;
 }
+
+/**
+ * folio_referenced() - Test if the folio was referenced.
+ * @folio: The folio to test.
+ * @is_locked: Caller holds lock on the folio.
+ * @memcg: target memory cgroup
+ * @vm_flags: A combination of all the vma->vm_flags which referenced the folio.
+ *
+ * Quick test_and_clear_referenced for all mappings of a folio,
+ *
+ * Return: The number of mappings which referenced the folio. Return -1 if
+ * the function bailed out due to rmap lock contention.
+ */
+int folio_referenced(struct folio *folio, int is_locked,
+		     struct mem_cgroup *memcg, unsigned long *vm_flags)
+{
+	return __folio_referenced(folio, is_locked, memcg, vm_flags, false);
+}
 EXPORT_SYMBOL_GPL(folio_referenced);
+
+/**
+ * folio_referenced_any() - Test if any mapping referenced the folio.
+ * @folio: The folio to test.
+ * @is_locked: Caller holds lock on the folio.
+ * @memcg: target memory cgroup
+ * @vm_flags: The vma->vm_flags of the mappings which referenced the folio.
+ *
+ * Like folio_referenced(), but stops at the first mapping that referenced
+ * the folio, leaving the accessed bits of the others as they are.  For a
+ * caller that only asks whether the folio was referenced: one mapped into
+ * hundreds of processes, as the libraries of every Android app are, then
+ * costs a walk to its first referencing mapping, not one of all of them.
+ *
+ * Return: 1 if a mapping referenced the folio, 0 if none did, -1 as
+ * folio_referenced().
+ */
+int folio_referenced_any(struct folio *folio, int is_locked,
+			 struct mem_cgroup *memcg, unsigned long *vm_flags)
+{
+	return __folio_referenced(folio, is_locked, memcg, vm_flags, true);
+}
 
 static int page_vma_mkclean_one(struct page_vma_mapped_walk *pvmw)
 {

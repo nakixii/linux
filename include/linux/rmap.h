@@ -659,6 +659,8 @@ static inline int folio_try_share_anon_rmap_pmd(struct folio *folio,
  */
 int folio_referenced(struct folio *, int is_locked,
 			struct mem_cgroup *memcg, unsigned long *vm_flags);
+int folio_referenced_any(struct folio *, int is_locked,
+			struct mem_cgroup *memcg, unsigned long *vm_flags);
 
 void try_to_migrate(struct folio *folio, enum ttu_flags flags);
 void try_to_unmap(struct folio *, enum ttu_flags flags);
@@ -792,6 +794,14 @@ struct anon_vma *folio_lock_anon_vma_read(struct folio *folio,
 static inline int folio_referenced(struct folio *folio, int is_locked,
 				  struct mem_cgroup *memcg,
 				  unsigned long *vm_flags)
+{
+	*vm_flags = 0;
+	return 0;
+}
+
+static inline int folio_referenced_any(struct folio *folio, int is_locked,
+				       struct mem_cgroup *memcg,
+				       unsigned long *vm_flags)
 {
 	*vm_flags = 0;
 	return 0;

@@ -922,8 +922,15 @@ static enum folio_references folio_check_references(struct folio *folio,
 	if (ret)
 		return ret;
 
-	referenced_ptes = folio_referenced(folio, 1, sc->target_mem_cgroup,
-					   &vm_flags);
+	/* MGLRU only asks whether the folio was referenced, not how often. */
+	if (lru_gen_enabled())
+		referenced_ptes = folio_referenced_any(folio, 1,
+						       sc->target_mem_cgroup,
+						       &vm_flags);
+	else
+		referenced_ptes = folio_referenced(folio, 1,
+						   sc->target_mem_cgroup,
+						   &vm_flags);
 
 	/*
 	 * The supposedly reclaimable folio was found to be in a VM_LOCKED vma.
