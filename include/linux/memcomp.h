@@ -10,6 +10,7 @@
 struct folio;
 struct mc16_slot;
 struct mc16_cluster;
+struct memcomp_async;
 struct memcomp_reclaim_ctx;
 struct vm_fault;
 
@@ -23,6 +24,9 @@ struct memcomp_ref {
 	struct mc16_cluster *cluster;
 	u32 token;
 };
+
+/* The most pages one asynchronous compression batch takes. */
+#define MEMCOMP_ASYNC_PAGES 32
 
 enum memcomp_reclaim_source {
 	MEMCOMP_RECLAIM_DIRECT,
@@ -88,6 +92,23 @@ bool memcomp_reserve(struct folio *folio);
 /* A non-NULL *@ctxp lease is consumed and cleared on every return. */
 bool memcomp_store_after_unmap(struct folio *folio,
 			       struct memcomp_reclaim_ctx **ctxp);
+/*
+ * A batch to compress a run of folios asynchronously with, or NULL when the
+ * compressor cannot or none is free.  Submit each folio once it is unmapped,
+ * wait once, store each with memcomp_store_after_unmap_async(), and put
+ * the batch back.  All batches serve foreground reclaim; a spare batch is
+ * available only while another batch would remain free.
+ */
+struct memcomp_async *memcomp_async_get(void);
+struct memcomp_async *memcomp_async_get_spare(void);
+bool memcomp_async_submit(struct memcomp_async *async,
+			  struct folio *folio);
+void memcomp_async_wait(struct memcomp_async *async);
+bool memcomp_async_complete(struct memcomp_async *async);
+bool memcomp_store_after_unmap_async(struct folio *folio,
+				     struct memcomp_reclaim_ctx **ctxp,
+					 struct memcomp_async *async);
+void memcomp_async_put(struct memcomp_async *async);
 void memcomp_rollback_folio(struct folio *folio);
 bool memcomp_folio_dirty(struct folio *folio);
 bool memcomp_folio_incompressible(struct folio *folio);
@@ -231,6 +252,44 @@ memcomp_store_after_unmap(struct folio *folio,
 	if (ctxp)
 		*ctxp = NULL;
 	return false;
+}
+
+static inline struct memcomp_async *memcomp_async_get(void)
+{
+	return NULL;
+}
+
+static inline struct memcomp_async *
+memcomp_async_get_spare(void)
+{
+	return NULL;
+}
+
+static inline bool memcomp_async_submit(struct memcomp_async *async,
+					struct folio *folio)
+{
+	return false;
+}
+
+static inline void memcomp_async_wait(struct memcomp_async *async)
+{
+}
+
+static inline bool memcomp_async_complete(struct memcomp_async *async)
+{
+	return true;
+}
+
+static inline bool
+memcomp_store_after_unmap_async(struct folio *folio,
+				struct memcomp_reclaim_ctx **ctxp,
+				    struct memcomp_async *async)
+{
+	return memcomp_store_after_unmap(folio, ctxp);
+}
+
+static inline void memcomp_async_put(struct memcomp_async *async)
+{
 }
 
 static inline void memcomp_rollback_folio(struct folio *folio)

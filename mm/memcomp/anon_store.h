@@ -172,7 +172,8 @@ mc16_anon_refresh_full(struct memcomp_reclaim_ctx **ctxp, const void *src,
 		ret = memcomp_prepare_payload_locked(ctxp, src + i * PAGE_SIZE,
 						     PAGE_SIZE, &lengths[i], &handle,
 						     &pool, nr_pages > 1,
-						     nr_pages == 1 ? store : NULL);
+						     nr_pages == 1 ? store : NULL,
+						     memcomp_store_precomp(store, i));
 		if (ret)
 			goto payload_fail;
 		payloads[i].word = handle;

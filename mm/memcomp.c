@@ -15,6 +15,7 @@
  */
 #define pr_fmt(fmt) "memcomp: " fmt
 
+#include <crypto/acompress.h>
 #include <crypto/algapi.h>
 #include <linux/atomic.h>
 #include <linux/bitmap.h>
@@ -45,6 +46,7 @@
 #include <linux/preempt.h>
 #include <linux/printk.h>
 #include <linux/rmap.h>
+#include <linux/scatterlist.h>
 #include <linux/sched/cputime.h>
 #include <linux/shrinker.h>
 #include <linux/slab.h>
@@ -300,6 +302,38 @@ struct memcomp_direct_staging {
 	struct memcomp_ctx_timing_record timing;
 };
 
+/*
+ * A compressor with an asynchronous form compresses a foreground run
+ * of folios together: reclaim hands all of them over, waits once, and
+ * stores each with the payloads already made.  One request per page of the
+ * run, a folio's pages in a row; see memcomp_async_submit().
+ */
+struct memcomp_async_req {
+	struct acomp_req *req;
+	struct memcomp_async *async;
+	struct scatterlist src;
+	struct scatterlist dst;
+	void *buf;
+	/* The folio whose page this is, at its offset from its first. */
+	struct folio *folio;
+	unsigned int len;
+	int ret;
+	/* Set only by memcomp's full software scan, never by a codec error. */
+	bool same_filled;
+	/* The value the software scan found. */
+	unsigned long element;
+};
+
+struct memcomp_async {
+	/* Requests not yet done, plus one until the batch is waited for. */
+	atomic_t pending;
+	struct completion done;
+	unsigned int id;
+	/* Requests taken, from the first. */
+	unsigned int nr;
+	struct memcomp_async_req reqs[MEMCOMP_ASYNC_PAGES];
+};
+
 /* Borrowed under the locked source folio's OWNER; never put this carrier. */
 struct mc16_zero_carrier {
 	struct memcomp_ref ref;
@@ -310,6 +344,11 @@ struct mc16_zero_carrier {
 
 struct memcomp_store_ctx {
 	struct memcomp_direct_staging *staging;
+	/*
+	 * The payloads, made before the store from the same contents: the
+	 * request for the folio's first page, followed by one for each other.
+	 */
+	const struct memcomp_async_req *precomp;
 	/* The span's anon_vma reference, for the caller to drop once stored. */
 	struct anon_vma *anon_vma;
 	struct mc16_zero_carrier zero;
@@ -494,7 +533,7 @@ static DEFINE_PER_CPU(struct memcomp_decomp_ctx, memcomp_decomp_ctxs) = {
 static bool memcomp_enabled;
 static char memcomp_compressor[MEMCOMP_COMPRESSOR_NAME_LEN] =
 	MEMCOMP_DEFAULT_COMPRESSOR;
-/* Serializes synchronous compressor selection. */
+/* Serializes compressor selection and publication of an async pool. */
 static DEFINE_MUTEX(memcomp_select_lock);
 
 static bool memcomp_is_enabled(void)
@@ -593,6 +632,8 @@ static atomic64_t memcomp_raw_reject_huge = ATOMIC64_INIT(0);
 static atomic64_t memcomp_raw_reject_ge_page = ATOMIC64_INIT(0);
 static atomic64_t memcomp_raw_reject_zs_fallback = ATOMIC64_INIT(0);
 static atomic64_t memcomp_raw_reject_net = ATOMIC64_INIT(0);
+static atomic64_t memcomp_async_payloads = ATOMIC64_INIT(0);
+static atomic64_t memcomp_async_fail = ATOMIC64_INIT(0);
 static atomic64_t memcomp_reserve_entry_alloc_fail = ATOMIC64_INIT(0);
 static atomic64_t memcomp_refresh_state_fail = ATOMIC64_INIT(0);
 static atomic64_t memcomp_refresh_payload_fail = ATOMIC64_INIT(0);
@@ -2879,13 +2920,26 @@ static int memcomp_compress_result(int ret, unsigned int *dst_len,
 	return 0;
 }
 
+/* Recheck the software same-filled result before storing the payload. */
+static bool memcomp_same_filled_plausible(const void *src,
+					  unsigned int src_len,
+					  unsigned long element)
+{
+	const unsigned long *words = src;
+	unsigned int last = src_len / sizeof(*words) - 1;
+
+	return src_len == PAGE_SIZE && words[0] == element &&
+	       words[last / 2] == element && words[last] == element;
+}
+
 static int
 memcomp_prepare_payload_locked(struct memcomp_reclaim_ctx **ctxp,
 			       const void *src, unsigned int src_len,
 				   unsigned int *length,
 				   unsigned long *handle, u8 *pool_idx,
 				   bool allow_provisional_raw,
-				   struct memcomp_store_ctx *store)
+				   struct memcomp_store_ctx *store,
+				   const struct memcomp_async_req *precomp)
 {
 	struct memcomp_compress_timing_stamp compress_timing;
 	struct memcomp_direct_staging *staging = NULL;
@@ -2906,10 +2960,35 @@ memcomp_prepare_payload_locked(struct memcomp_reclaim_ctx **ctxp,
 
 	lockdep_assert_held(&ctx->lock);
 
-	if (page_same_filled(src, &element)) {
+	if (precomp && precomp->same_filled &&
+	    !memcomp_same_filled_plausible(src, src_len, precomp->element))
+		precomp = NULL;
+	/*
+	 * A software same-filled result follows the same full scan as a
+	 * synchronous store.
+	 */
+	if (precomp ? precomp->same_filled :
+		      page_same_filled(src, &element)) {
 		*length = 0;
-		*handle = element;
+		*handle = precomp ? precomp->element : element;
 		return 0;
+	}
+
+	/* The page has been compressed; all that is left is to store it. */
+	if (precomp) {
+		target = memcomp_select_pool_idx();
+		pool = memcomp_pools[target];
+		huge_class_size = zs_huge_class_size(pool);
+		allow_slow = ctx->background;
+		compressed = precomp->buf;
+		dst_len = precomp->len;
+		ret = memcomp_compress_result(precomp->ret, &dst_len,
+					      src_len);
+		if (!ret)
+			raw_reason = memcomp_payload_raw_reason(dst_len,
+								src_len,
+								    huge_class_size);
+		goto have_payload;
 	}
 
 	target = memcomp_select_pool_idx();
@@ -2951,6 +3030,7 @@ memcomp_prepare_payload_locked(struct memcomp_reclaim_ctx **ctxp,
 		timing = &staging->timing;
 		preempt_enable();
 	}
+have_payload:
 	if (ret) {
 		memcomp_debug_inc(&memcomp_compress_fail);
 		return ret;
@@ -3045,7 +3125,8 @@ static int memcomp_prepare_payload(const void *src, unsigned int src_len,
 		return -EBUSY;
 	ret = memcomp_prepare_payload_locked(&ctx, src, src_len, length,
 					     handle, pool_idx,
-						 allow_provisional_raw, NULL);
+						 allow_provisional_raw, NULL,
+						 NULL);
 	WARN_ON_ONCE(!ctx);
 	memcomp_put_comp_ctx(ctx);
 	return ret;
@@ -3073,6 +3154,23 @@ memcomp_arch_prepare_to_swap(struct folio *folio)
  * MC_PENDING with a reference on the resident folio, so faults arriving
  * between unmap and the payload store can map the original pages back.
  */
+
+/*
+ * The payload made beforehand for page @i of the folio @store is for, when
+ * one was and it says what compressing the page would: a size, that the
+ * page does not shrink, or that it is same-filled.
+ */
+static const struct memcomp_async_req *
+memcomp_store_precomp(const struct memcomp_store_ctx *store,
+		      unsigned int i)
+{
+	const struct memcomp_async_req *r;
+
+	if (!store || !store->precomp)
+		return NULL;
+	r = &store->precomp[i];
+	return !r->ret || r->ret == -E2BIG || r->ret == -ENOSPC ? r : NULL;
+}
 
 #include "memcomp/anon_store.h"
 
@@ -4256,10 +4354,11 @@ bool memcomp_folio_incompressible(struct folio *folio)
 
 static bool
 __memcomp_store_after_unmap(struct folio *folio,
-			    struct memcomp_reclaim_ctx **ctxp)
+			    struct memcomp_reclaim_ctx **ctxp,
+				const struct memcomp_async_req *precomp)
 {
 	struct memcomp_ctx_timing_record *timing;
-	struct memcomp_store_ctx store = { };
+	struct memcomp_store_ctx store = { .precomp = precomp };
 	enum memcomp_anon_store_fail failure;
 	struct memcomp_reclaim_ctx *ctx;
 	unsigned int nr_pages;
@@ -4304,7 +4403,299 @@ __memcomp_store_after_unmap(struct folio *folio,
 bool memcomp_store_after_unmap(struct folio *folio,
 			       struct memcomp_reclaim_ctx **ctxp)
 {
-	return __memcomp_store_after_unmap(folio, ctxp);
+	return __memcomp_store_after_unmap(folio, ctxp, NULL);
+}
+
+/*
+ * Asynchronous compression.  A batch lets a reclaimer compress its run of
+ * folios at once on a compressor that works on its own - a hardware engine,
+ * which otherwise has a CPU spin through every page - and sleep through all
+ * of them at once.  A shared pool of batches serves foreground reclaim.
+ * A run that finds none free is compressed synchronously in the store,
+ * as it would be without them.  A foreground reclaimer may have two, one with
+ * the compressor while it fills the other, but takes its second only while
+ * that leaves another free; see memcomp_async_get_spare().
+ */
+struct memcomp_async_pool {
+	struct crypto_acomp *tfm; /* Release-published after all batches. */
+	spinlock_t lock; /* Protects the free-batch bitmap. */
+	unsigned long free;
+	unsigned int nr;
+	struct memcomp_async *batches[BITS_PER_LONG];
+};
+
+static struct memcomp_async_pool memcomp_async_pool = {
+	.lock = __SPIN_LOCK_UNLOCKED(memcomp_async_pool.lock),
+};
+
+/* Take a free foreground batch, leaving @keep for another reclaimer. */
+static struct memcomp_async *
+memcomp_async_take(struct memcomp_async_pool *pool, unsigned int keep)
+{
+	struct memcomp_async *async = NULL;
+	unsigned int i;
+
+	spin_lock(&pool->lock);
+	i = find_first_bit(&pool->free, pool->nr);
+	if (i < pool->nr && hweight_long(pool->free) > keep) {
+		__clear_bit(i, &pool->free);
+		async = pool->batches[i];
+	}
+	spin_unlock(&pool->lock);
+	if (!async)
+		return NULL;
+
+	atomic_set(&async->pending, 1);
+	reinit_completion(&async->done);
+	async->nr = 0;
+	return async;
+}
+
+static void memcomp_async_give(struct memcomp_async_pool *pool,
+			       struct memcomp_async *async)
+{
+	/* Nothing may still be writing into a batch handed back. */
+	if (atomic_read(&async->pending))
+		memcomp_async_wait(async);
+	spin_lock(&pool->lock);
+	__set_bit(async->id, &pool->free);
+	spin_unlock(&pool->lock);
+}
+
+struct memcomp_async *memcomp_async_get(void)
+{
+	if (!memcomp_is_enabled())
+		return NULL;
+	/* Pairs with async_init's release publication of a late pool. */
+	if (!smp_load_acquire(&memcomp_async_pool.tfm))
+		return NULL;
+	return memcomp_async_take(&memcomp_async_pool, 0);
+}
+
+/*
+ * memcomp_async_get(), but only while another foreground batch would
+ * still be free after: for a reclaimer that has one out already, and would
+ * otherwise leave the next to come none.
+ */
+struct memcomp_async *memcomp_async_get_spare(void)
+{
+	if (!memcomp_is_enabled())
+		return NULL;
+	/* Pairs with async_init's release publication of a late pool. */
+	if (!smp_load_acquire(&memcomp_async_pool.tfm))
+		return NULL;
+	return memcomp_async_take(&memcomp_async_pool, 1);
+}
+
+void memcomp_async_put(struct memcomp_async *async)
+{
+	if (async)
+		memcomp_async_give(&memcomp_async_pool, async);
+}
+
+static void memcomp_async_done(void *data, int err)
+{
+	struct memcomp_async_req *r = data;
+	struct memcomp_async *async = r->async;
+
+	/* A backlogged request has been started; it completes later. */
+	if (err == -EINPROGRESS)
+		return;
+
+	r->len = r->req->dlen;
+	r->ret = err;
+	if (atomic_dec_and_test(&async->pending))
+		complete(&async->done);
+}
+
+/*
+ * Start compressing the pages of @folio in @async, each a request of its
+ * own.  The pages may be read any time until the batch is waited for, so
+ * their contents must already be what the store will keep: the folio is
+ * locked and unmapped, with the TLB flushed, and holds no more references
+ * than the store accepts.  Whatever then changes that also fails the
+ * store's own checks, which run again before the payloads are used.
+ *
+ * Returns whether the folio went in, which takes a request for every page,
+ * or room for them.  One that did not is compressed by the store, as usual.
+ * A same-filled page takes its request too, to pass the software scan
+ * result to the store without invoking the compressor.
+ */
+bool memcomp_async_submit(struct memcomp_async *async,
+			  struct folio *folio)
+{
+	unsigned int nr_pages = folio_nr_pages(folio);
+	u32 flags;
+	unsigned int i;
+
+	if (!async || !folio_test_locked(folio) ||
+	    nr_pages > MEMCOMP_ASYNC_PAGES - async->nr)
+		return false;
+	if (folio_mapped(folio) || folio_maybe_dma_pinned(folio) ||
+	    folio_ref_count(folio) != 1 + nr_pages)
+		return false;
+
+	/* The batch bounds the number of outstanding requests. */
+	flags = CRYPTO_TFM_REQ_MAY_BACKLOG;
+	for (i = 0; i < nr_pages; i++) {
+		struct memcomp_async_req *r = &async->reqs[async->nr + i];
+		unsigned long element;
+		bool same;
+		void *src;
+		int ret;
+
+		r->folio = folio;
+		r->same_filled = false;
+		/* The store keeps these as they are, without a payload. */
+		src = kmap_local_folio(folio, i * PAGE_SIZE);
+		same = page_same_filled(src, &element);
+		kunmap_local(src);
+		if (same) {
+			r->ret = 0;
+			r->len = 0;
+			r->element = element;
+			r->same_filled = true;
+			continue;
+		}
+
+		sg_init_table(&r->src, 1);
+		sg_set_page(&r->src, folio_page(folio, i), PAGE_SIZE, 0);
+		sg_init_one(&r->dst, r->buf, PAGE_SIZE);
+		acomp_request_set_params(r->req, &r->src, &r->dst, PAGE_SIZE,
+					 PAGE_SIZE);
+		acomp_request_set_callback(r->req, flags,
+					   memcomp_async_done, r);
+		atomic_inc(&async->pending);
+		ret = crypto_acomp_compress(r->req);
+		/* Anything else, and the request is done without a callback. */
+		if (ret != -EINPROGRESS && ret != -EBUSY)
+			memcomp_async_done(r, ret);
+	}
+	async->nr += nr_pages;
+	return true;
+}
+
+/*
+ * Wait for every request of @async; call once, before using any of them.
+ * The compressor is doing the work meanwhile, so the wait is no load.
+ */
+void memcomp_async_wait(struct memcomp_async *async)
+{
+	if (async && !atomic_dec_and_test(&async->pending))
+		wait_for_completion_state(&async->done, TASK_IDLE);
+}
+
+/*
+ * Whether every request submitted in @async has completed, so that waiting
+ * for it would not sleep; ask before memcomp_async_wait() only.
+ */
+bool memcomp_async_complete(struct memcomp_async *async)
+{
+	return !async || atomic_read(&async->pending) == 1;
+}
+
+/*
+ * memcomp_store_after_unmap(), with the payloads @async made for @folio,
+ * if it made them.  A page whose request failed for any reason but the page
+ * not shrinking is compressed by the store itself.
+ */
+bool memcomp_store_after_unmap_async(struct folio *folio,
+				     struct memcomp_reclaim_ctx **ctxp,
+					 struct memcomp_async *async)
+{
+	const struct memcomp_async_req *precomp = NULL;
+	unsigned int nr_pages = folio_nr_pages(folio);
+	unsigned int i;
+
+	for (i = 0; async && i < async->nr; i++) {
+		if (async->reqs[i].folio != folio)
+			continue;
+		/* Taken in a row for the folio, which cannot have split. */
+		if (!WARN_ON_ONCE(nr_pages > async->nr - i))
+			precomp = &async->reqs[i];
+		break;
+	}
+	for (i = 0; precomp && i < nr_pages; i++) {
+		int ret = precomp[i].ret;
+
+		/* A software same-filled page has no compressed payload. */
+		if (precomp[i].same_filled)
+			continue;
+		if (!ret || ret == -E2BIG || ret == -ENOSPC)
+			memcomp_debug_inc(&memcomp_async_payloads);
+		else
+			memcomp_debug_inc(&memcomp_async_fail);
+	}
+	return __memcomp_store_after_unmap(folio, ctxp, precomp);
+}
+
+static void memcomp_async_free_batch(struct memcomp_async *async)
+{
+	unsigned int i;
+
+	for (i = 0; i < MEMCOMP_ASYNC_PAGES; i++) {
+		if (async->reqs[i].req)
+			acomp_request_free(async->reqs[i].req);
+		kfree(async->reqs[i].buf);
+	}
+	kfree(async);
+}
+
+/*
+ * Set up the batches when the compressor has an asynchronous form; the
+ * synchronous one stays what every other path uses.  Both are the same
+ * algorithm by name, so they make the same payloads.
+ */
+static void memcomp_async_init(struct memcomp_async_pool *pool,
+			       const char *compressor)
+{
+	unsigned int nr = min_t(unsigned int, num_possible_cpus(),
+				    BITS_PER_LONG);
+	struct crypto_acomp *tfm;
+	unsigned int i, j;
+
+	lockdep_assert_held(&memcomp_select_lock);
+	if (pool->tfm)
+		return;
+
+	tfm = crypto_alloc_acomp(compressor, CRYPTO_ALG_ASYNC,
+				 CRYPTO_ALG_ASYNC | CRYPTO_NOLOAD);
+	if (IS_ERR(tfm))
+		return;
+
+	for (i = 0; i < nr; i++) {
+		struct memcomp_async *async;
+
+		async = kzalloc(sizeof(*async), GFP_KERNEL);
+		if (!async)
+			break;
+		init_completion(&async->done);
+		async->id = i;
+		for (j = 0; j < MEMCOMP_ASYNC_PAGES; j++) {
+			struct memcomp_async_req *r = &async->reqs[j];
+
+			r->async = async;
+			r->req = acomp_request_alloc(tfm);
+			r->buf = kmalloc(PAGE_SIZE, GFP_KERNEL);
+			if (!r->req || !r->buf)
+				break;
+		}
+		if (j < MEMCOMP_ASYNC_PAGES) {
+			memcomp_async_free_batch(async);
+			break;
+		}
+		pool->batches[i] = async;
+		__set_bit(i, &pool->free);
+	}
+	if (!i) {
+		crypto_free_acomp(tfm);
+		return;
+	}
+	pool->nr = i;
+	/* Late readers must see every request, buffer and free bit first. */
+	smp_store_release(&pool->tfm, tfm);
+	pr_info("async compression through %s, %u foreground batches\n",
+		crypto_tfm_alg_driver_name(crypto_acomp_tfm(tfm)), i);
 }
 
 static void memcomp_destroy_comp_ctxs(void)
@@ -4518,6 +4909,7 @@ static int memcomp_start(void)
 		memcomp_meta_shrinker->scan_objects = mc16_meta_shrinker_scan;
 		shrinker_register(memcomp_meta_shrinker);
 	}
+	memcomp_async_init(&memcomp_async_pool, memcomp_compressor);
 	/* Make every initialized resource visible before enabling callers. */
 	smp_store_release(&memcomp_enabled, true);
 	pr_info("using %s\n", memcomp_compressor);
@@ -4549,13 +4941,15 @@ err_comp:
 /* As long as the driver core waits for the modules a device's probe needs. */
 #define MEMCOMP_COMPRESSOR_WAIT	(10 * HZ)
 
-/* The startup decision is protected by memcomp_select_lock. */
+/* The startup decision and late async work share memcomp_select_lock. */
 struct memcomp_compressor_select {
 	struct delayed_work work;
 	struct notifier_block nb;
+	struct memcomp_async_pool *pool;
 	char *compressor;
 	unsigned long deadline;
 	bool decided;
+	bool started;
 };
 
 static void memcomp_select_worker(struct work_struct *work);
@@ -4568,6 +4962,7 @@ static struct memcomp_compressor_select memcomp_select = {
 	.nb = {
 		.notifier_call = memcomp_crypto_notify,
 	},
+	.pool = &memcomp_async_pool,
 	.compressor = memcomp_compressor,
 };
 
@@ -4597,8 +4992,11 @@ static void memcomp_select_worker(struct work_struct *work)
 	select = container_of(to_delayed_work(work),
 			      struct memcomp_compressor_select, work);
 	mutex_lock(&memcomp_select_lock);
-	if (select->decided)
+	if (select->decided) {
+		if (select->started)
+			memcomp_async_init(select->pool, select->compressor);
 		goto out;
+	}
 
 	if (crypto_has_comp(select->compressor, 0, 0) != 1) {
 		if (time_before(now, select->deadline)) {
@@ -4609,10 +5007,11 @@ static void memcomp_select_worker(struct work_struct *work)
 		}
 		pr_warn("compressor %s unavailable\n", select->compressor);
 	}
-	/* The synchronous compressor choice is final. */
+	/* The synchronous choice is final; keep listening for its async form. */
 	select->decided = true;
 	if (crypto_has_comp(select->compressor, 0, 0) == 1 &&
 	    !memcomp_start()) {
+		select->started = true;
 		goto out;
 	}
 
@@ -4622,6 +5021,7 @@ static void memcomp_select_worker(struct work_struct *work)
 			sizeof(memcomp_compressor));
 		if (crypto_has_comp(select->compressor, 0, 0) == 1 &&
 		    !memcomp_start()) {
+			select->started = true;
 			goto out;
 		}
 	}
@@ -4798,6 +5198,8 @@ static ssize_t __events_show(char *buf)
 			  "raw_reject_ge_page %llu\n"
 			  "raw_reject_zs_fallback %llu\n"
 			  "raw_reject_net %llu\n"
+			  "async_payloads %llu\n"
+			  "async_fail %llu\n"
 			  "reserve_entry_alloc_fail %llu\n"
 			  "refresh_state_fail %llu\n"
 			  "refresh_payload_fail %llu\n"
@@ -4868,6 +5270,8 @@ static ssize_t __events_show(char *buf)
 			  raw_reject_ge_page,
 			  raw_reject_zs_fallback,
 			  raw_reject_net,
+			  (u64)atomic64_read(&memcomp_async_payloads),
+			  (u64)atomic64_read(&memcomp_async_fail),
 			  (u64)atomic64_read(&memcomp_reserve_entry_alloc_fail),
 			  (u64)atomic64_read(&memcomp_refresh_state_fail),
 			  (u64)atomic64_read(&memcomp_refresh_payload_fail),

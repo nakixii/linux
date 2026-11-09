@@ -1189,9 +1189,229 @@ static bool may_enter_fs(struct folio *folio, gfp_t gfp_mask)
 	return !data_race(folio_swap_flags(folio) & SWP_FS_OPS);
 }
 
+#ifdef CONFIG_MEMCOMP
+/*
+ * Anonymous folios shrink_folio_list() has reserved and unmapped for
+ * memcomp, kept back to be compressed together on a compressor that
+ * works on its own; see memcomp_async_get().  The reclaimer flushes the
+ * TLB once for all of them and sleeps once while they compress, instead of
+ * having a CPU spin through each page.  These batches serve direct reclaim,
+ * kswapd or MADV_PAGEOUT in the task performing the reclaim.
+ *
+ * A full batch is handed to the compressor and left with it while the next
+ * is unmapped; the one before is stored then, once this one is also with the
+ * compressor.  So the CPU unmaps and stores while the compressor compresses,
+ * instead of each waiting for the other.
+ *
+ * The context lease each store needs is taken after the wait, so a batch
+ * does not hold the limited store contexts while it compresses.  Failure
+ * to acquire a lease fails the store; an unmapped folio cannot fall back
+ * to swap without first restoring its mappings.
+ */
+struct memcomp_deferred_batch {
+	struct list_head folios;
+	unsigned int nr_pages;
+	struct memcomp_async *async;
+};
+
+struct memcomp_deferred {
+	/* The batch being filled, and the one before, with the compressor. */
+	struct memcomp_deferred_batch fill;
+	struct memcomp_deferred_batch busy;
+	enum memcomp_reclaim_source source;
+	/* Where shrink_folio_list() puts what it frees and what it keeps. */
+	struct folio_batch *free_folios;
+	struct list_head *ret_folios;
+	struct reclaim_stat *stat;
+	unsigned int nr_reclaimed;
+};
+
+/*
+ * Whether a folio about to be unmapped for its store can be kept back in @d,
+ * which takes a batch for it if it has none.  memcomp_defer() then keeps
+ * it back once it is unmapped.
+ */
+static bool memcomp_may_defer(struct memcomp_deferred *d,
+			      struct folio *folio)
+{
+	if (folio_nr_pages(folio) > MEMCOMP_ASYNC_PAGES)
+		return false;
+	if (!d->fill.async)
+		d->fill.async = memcomp_async_get();
+	return d->fill.async;
+}
+
+static void memcomp_store_deferred(struct memcomp_deferred *d,
+				   struct memcomp_async *async,
+				   struct folio *folio)
+{
+	unsigned int nr_pages = folio_nr_pages(folio);
+	struct memcomp_reclaim_ctx *ctx;
+
+	if (folio_mapped(folio)) {
+		memcomp_count_unmap_fail(nr_pages);
+		memcomp_rollback_folio(folio);
+		goto activate;
+	}
+	/*
+	 * The lease is not held through the wait; there are few of them.  A
+	 * folio of a batch too small to have been submitted is compressed here.
+	 */
+	ctx = memcomp_reclaim_ctx_get(nr_pages, d->source);
+	if (!ctx || !memcomp_store_after_unmap_async(folio, &ctx, async)) {
+		memcomp_rollback_folio(folio);
+		goto activate;
+	}
+	if (folio_test_dirty(folio))
+		folio_clear_dirty(folio);
+
+	/* As shrink_folio_list() goes on with a stored folio. */
+	if (folio_maybe_dma_pinned(folio)) {
+		memcomp_finish_fail(folio, nr_pages);
+		goto activate;
+	}
+	if (!memcomp_release_folio(folio)) {
+		memcomp_finish_fail(folio, nr_pages);
+		goto keep;
+	}
+	folio_unlock(folio);
+	d->nr_reclaimed += nr_pages;
+	folio_unqueue_deferred_split(folio);
+	if (folio_batch_add(d->free_folios, folio) == 0) {
+		mem_cgroup_uncharge_folios(d->free_folios);
+		try_to_unmap_flush();
+		free_unref_folios(d->free_folios);
+	}
+	return;
+
+activate:
+	if (!folio_test_mlocked(folio)) {
+		folio_set_active(folio);
+		d->stat->nr_activate[folio_is_file_lru(folio)] += nr_pages;
+		count_memcg_folio_events(folio, PGACTIVATE, nr_pages);
+	}
+keep:
+	folio_unlock(folio);
+	list_add(&folio->lru, d->ret_folios);
+}
+
+/*
+ * Compress small batches synchronously.  Deferring them adds submission and
+ * wakeup overhead without enough work to amortize those costs.
+ */
+#define MEMCOMP_DEFER_MIN_PAGES	8
+
+/*
+ * Store what @b has kept back, with what the compressor made of it if it was
+ * submitted, and give back its batch.
+ */
+static void memcomp_store_batch(struct memcomp_deferred *d,
+				struct memcomp_deferred_batch *b)
+{
+	struct folio *folio, *next;
+
+	memcomp_async_wait(b->async);
+	list_for_each_entry_safe(folio, next, &b->folios, lru) {
+		list_del(&folio->lru);
+		memcomp_store_deferred(d, b->async, folio);
+	}
+	memcomp_async_put(b->async);
+	b->async = NULL;
+	b->nr_pages = 0;
+}
+
+/*
+ * Hand what @d has kept back to the compressor, then store the batch before,
+ * which the compressor has had meanwhile; the new one is stored next time
+ * round.  Too few pages to be worth the compressor's while are stored
+ * straight away.
+ */
+static void memcomp_submit_deferred(struct memcomp_deferred *d)
+{
+	struct memcomp_deferred_batch *fill = &d->fill;
+	struct memcomp_deferred_batch *busy = &d->busy;
+	struct folio *folio;
+
+	if (list_empty(&fill->folios))
+		return;
+	/* No CPU may write through a stale entry once they are read. */
+	try_to_unmap_flush();
+	if (fill->nr_pages >= MEMCOMP_DEFER_MIN_PAGES)
+		list_for_each_entry(folio, &fill->folios, lru)
+			memcomp_async_submit(fill->async, folio);
+	memcomp_store_batch(d, busy);
+	if (fill->nr_pages < MEMCOMP_DEFER_MIN_PAGES) {
+		memcomp_store_batch(d, fill);
+		return;
+	}
+	list_splice_init(&fill->folios, &busy->folios);
+	busy->nr_pages = fill->nr_pages;
+	busy->async = fill->async;
+	fill->nr_pages = 0;
+	fill->async = NULL;
+}
+
+/* Compress and store all @d has kept back, and give back its batches. */
+static void memcomp_finish_deferred(struct memcomp_deferred *d)
+{
+	memcomp_submit_deferred(d);
+	memcomp_store_batch(d, &d->busy);
+	memcomp_async_put(d->fill.async);
+	d->fill.async = NULL;
+}
+
+/*
+ * Make room in @d for a folio of @nr_pages, submitting what it has if it is
+ * full.  A batch the compressor is done with is stored at once, so that its
+ * folios are not held locked longer than they have to be.  While one is with
+ * the compressor, the batch to fill next is taken now: if that would leave
+ * the pool none to spare, the one out is stored first and its batch taken
+ * back, rather than storing each folio by itself meanwhile.  Called before
+ * the folio's own context lease is taken: the stores take leases of their
+ * own.
+ */
+static void memcomp_defer_room(struct memcomp_deferred *d,
+			       unsigned int nr_pages)
+{
+	if (d->fill.nr_pages + nr_pages > MEMCOMP_ASYNC_PAGES)
+		memcomp_submit_deferred(d);
+	if (memcomp_async_complete(d->busy.async))
+		memcomp_store_batch(d, &d->busy);
+	if (d->fill.async || !d->busy.async ||
+	    nr_pages > MEMCOMP_ASYNC_PAGES)
+		return;
+	d->fill.async = memcomp_async_get_spare();
+	if (!d->fill.async) {
+		memcomp_store_batch(d, &d->busy);
+		d->fill.async = memcomp_async_get();
+	}
+}
+
+/*
+ * Keep back a reserved folio that is now unmapped, its TLB flush maybe still
+ * to come, for its store.  Returns false if it is to be stored now after all.
+ */
+static bool memcomp_defer(struct memcomp_deferred *d,
+			  struct folio *folio)
+{
+	unsigned int nr_pages = folio_nr_pages(folio);
+
+	if (d->fill.nr_pages + nr_pages > MEMCOMP_ASYNC_PAGES ||
+	    !memcomp_may_defer(d, folio))
+		return false;
+	list_add_tail(&folio->lru, &d->fill.folios);
+	d->fill.nr_pages += nr_pages;
+	return true;
+}
+
 /*
  * shrink_folio_list() returns the number of reclaimed pages
  */
+#else
+/*
+ * shrink_folio_list() returns the number of reclaimed pages
+ */
+#endif
 static unsigned int shrink_folio_list(struct list_head *folio_list,
 		struct pglist_data *pgdat, struct scan_control *sc,
 		struct reclaim_stat *stat, bool ignore_references)
@@ -1203,6 +1423,17 @@ static unsigned int shrink_folio_list(struct list_head *folio_list,
 	unsigned int pgactivate = 0;
 	bool do_demote_pass;
 	struct swap_iocb *plug = NULL;
+#ifdef CONFIG_MEMCOMP
+	struct memcomp_deferred mc_deferred = {
+		.fill.folios = LIST_HEAD_INIT(mc_deferred.fill.folios),
+		.busy.folios = LIST_HEAD_INIT(mc_deferred.busy.folios),
+		.source = current_is_kswapd() ? MEMCOMP_RECLAIM_KSWAPD :
+						MEMCOMP_RECLAIM_DIRECT,
+		.free_folios = &free_folios,
+		.ret_folios = &ret_folios,
+		.stat = stat,
+	};
+#endif
 
 	folio_batch_init(&free_folios);
 	memset(stat, 0, sizeof(*stat));
@@ -1460,6 +1691,7 @@ memcomp_try:
 				if (!memcomp_reserve(folio))
 					goto memcomp_fallback_swap;
 				memcomp_reserved = true;
+				memcomp_defer_room(&mc_deferred, nr_pages);
 				memcomp_ctx = memcomp_reclaim_ctx_get(nr_pages,
 								      memcomp_source);
 				if (!memcomp_ctx) {
@@ -1599,7 +1831,9 @@ anon_backing_ready:
 				goto activate_locked;
 			}
 #ifdef CONFIG_MEMCOMP
-			if (memcomp_reserved) {
+			/* Or flushed and stored with others, below. */
+			if (memcomp_reserved &&
+			    !memcomp_may_defer(&mc_deferred, folio)) {
 				try_to_unmap_flush();
 				if (folio_mapped(folio)) {
 					memcomp_count_unmap_fail(nr_pages);
@@ -1624,6 +1858,11 @@ anon_backing_ready:
 
 		if (memcomp_reserved && !memcomp_stored &&
 		    !folio_mapped(folio)) {
+			if (memcomp_defer(&mc_deferred, folio)) {
+				memcomp_reclaim_ctx_put(memcomp_ctx);
+				continue;
+			}
+			/* It may have been unmapped for keeping back. */
 			try_to_unmap_flush();
 			if (folio_mapped(folio)) {
 				memcomp_count_unmap_fail(nr_pages);
@@ -1888,6 +2127,13 @@ keep:
 				folio_test_unevictable(folio), folio);
 	}
 	/* 'folio_list' is always empty here */
+#ifdef CONFIG_MEMCOMP
+
+	memcomp_finish_deferred(&mc_deferred);
+	nr_reclaimed += mc_deferred.nr_reclaimed;
+	mc_deferred.nr_reclaimed = 0;
+#endif
+
 	/* Migrate folios selected for demotion */
 	nr_demoted = demote_folio_list(&demote_folios, pgdat);
 	nr_reclaimed += nr_demoted;
