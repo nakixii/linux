@@ -62,7 +62,8 @@ static inline int current_is_kswapd(void)
  */
 #define SWP_PTE_MARKER_NUM 1
 #define SWP_PTE_MARKER     (MAX_SWAPFILES + SWP_HWPOISON_NUM + \
-			    SWP_MIGRATION_NUM + SWP_DEVICE_NUM)
+			    SWP_MIGRATION_NUM + SWP_DEVICE_NUM + \
+			    SWP_MEMCOMP_NUM)
 
 /*
  * Unaddressable device memory support. See include/linux/hmm.h and
@@ -84,6 +85,14 @@ static inline int current_is_kswapd(void)
 #define SWP_DEVICE_EXCLUSIVE_READ (MAX_SWAPFILES+SWP_HWPOISON_NUM+SWP_MIGRATION_NUM+3)
 #else
 #define SWP_DEVICE_NUM 0
+#endif
+
+#ifdef CONFIG_MEMCOMP
+#define SWP_MEMCOMP_NUM 1
+#define SWP_MEMCOMP (MAX_SWAPFILES + SWP_HWPOISON_NUM + \
+			 SWP_MIGRATION_NUM + SWP_DEVICE_NUM)
+#else
+#define SWP_MEMCOMP_NUM 0
 #endif
 
 /*
@@ -116,7 +125,7 @@ static inline int current_is_kswapd(void)
 
 #define MAX_SWAPFILES \
 	((1 << MAX_SWAPFILES_SHIFT) - SWP_DEVICE_NUM - \
-	SWP_MIGRATION_NUM - SWP_HWPOISON_NUM - \
+	SWP_MIGRATION_NUM - SWP_HWPOISON_NUM - SWP_MEMCOMP_NUM - \
 	SWP_PTE_MARKER_NUM)
 
 /*

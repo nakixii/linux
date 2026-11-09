@@ -109,6 +109,28 @@ static inline pgoff_t swp_offset(swp_entry_t entry)
 	return entry.val & SWP_OFFSET_MASK;
 }
 
+#ifdef CONFIG_MEMCOMP
+static inline bool is_memcomp_entry(swp_entry_t entry)
+{
+	return swp_type(entry) == SWP_MEMCOMP;
+}
+
+static inline swp_entry_t make_memcomp_entry(pgoff_t offset)
+{
+	return swp_entry(SWP_MEMCOMP, offset);
+}
+#else
+static inline bool is_memcomp_entry(swp_entry_t entry)
+{
+	return false;
+}
+
+static inline swp_entry_t make_memcomp_entry(pgoff_t offset)
+{
+	return swp_entry(0, 0);
+}
+#endif
+
 /*
  * This should only be called upon a pfn swap entry to get the PFN stored
  * in the swap entry.  Please refers to is_pfn_swap_entry() for definition
