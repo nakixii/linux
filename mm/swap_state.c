@@ -417,6 +417,11 @@ struct folio *filemap_get_incore_folio(struct address_space *mapping,
 		return ERR_PTR(-ENOENT);
 
 	swp = radix_to_swp_entry(folio);
+#ifdef CONFIG_MEMCOMP
+	/* A compressed value is not a folio; mincore queries it outside PTL. */
+	if (is_memcomp_entry(swp))
+		return ERR_PTR(-EEXIST);
+#endif
 	/* There might be swapin error entries in shmem mapping. */
 	if (non_swap_entry(swp))
 		return ERR_PTR(-ENOENT);

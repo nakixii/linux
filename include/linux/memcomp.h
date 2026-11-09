@@ -45,6 +45,8 @@ enum memcomp_anon_fail_event {
 #ifdef CONFIG_MEMCOMP
 
 bool memcomp_available(void);
+/* Process context only, with no PTL or XArray lock held. */
+bool memcomp_mincore(unsigned long token);
 bool memcomp_release_folio_reclaim(struct folio *folio,
 				   struct mem_cgroup *target_memcg);
 void memcomp_publish_cache_eviction(struct folio *folio, struct memcomp_ref *ref);
@@ -190,6 +192,11 @@ bool is_memcomp_shadow(void *shadow);
 unsigned long memcomp_shadow_token(void *shadow);
 
 #else
+
+static inline bool memcomp_mincore(unsigned long token)
+{
+	return false;
+}
 
 static inline bool memcomp_available(void)
 {

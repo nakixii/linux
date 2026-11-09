@@ -3903,6 +3903,7 @@ static bool memcomp_writeback_defrag_pass(void)
  * Core load - decompress one page from @entry into @dst.  Sleeps on the
  * token lock and possibly swap IO; never called under the PTE lock.
  */
+#include "memcomp/mincore.h"
 #include "memcomp/workingset_load.h"
 #include "memcomp/load.h"
 #include "memcomp/consumers.h"
