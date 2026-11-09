@@ -1230,6 +1230,7 @@ retry:
 		 */
 		if (!src_folio) {
 			struct folio *folio;
+			struct page *page;
 			bool locked;
 
 			/*
@@ -1243,8 +1244,20 @@ retry:
 				goto out;
 			}
 
-			folio = vm_normal_folio(src_vma, src_addr, orig_src_pte);
-			if (!folio || !PageAnonExclusive(&folio->page)) {
+			/*
+			 * Check the page to be moved, not the first of its
+			 * folio.  try_to_unmap() unshares a large folio page
+			 * by page into swap entries, so while
+			 * reclaim holds it, or after reclaim gave up partway,
+			 * the first page can have lost its exclusive flag
+			 * when this one has not.  While reclaim still holds
+			 * the folio, the trylock below sends a large one back
+			 * with -EAGAIN; once the folio is split they are the
+			 * same.
+			 */
+			page = vm_normal_page(src_vma, src_addr, orig_src_pte);
+			folio = page ? page_folio(page) : NULL;
+			if (!folio || !PageAnonExclusive(page)) {
 				spin_unlock(src_ptl);
 				err = -EBUSY;
 				goto out;
