@@ -52,6 +52,8 @@ static inline void memcomp_count_normal_swap_fallback(void)
 {
 }
 #endif
+void memcomp_reclaim_writeback_begin(int nid, int reclaim_idx);
+void memcomp_reclaim_writeback_end(int nid);
 #ifdef CONFIG_MEMCOMP_DEBUG_STATS
 void memcomp_count_anon_fail(enum memcomp_anon_fail_event event,
 			     unsigned int nr_pages);
@@ -127,6 +129,14 @@ bool memcomp_entry_set_refresh_pending(unsigned long token);
 void memcomp_entry_clear_refresh_pending(unsigned long token);
 bool memcomp_entry_get(unsigned long token);
 bool memcomp_entry_present(unsigned long token);
+#ifdef CONFIG_SWAP
+int memcomp_swapoff(unsigned int type);
+#else
+static inline int memcomp_swapoff(unsigned int type)
+{
+	return 0;
+}
+#endif
 
 /*
  * Page-cache variants for shmem/tmpfs pages. A zero store result prepares
@@ -164,6 +174,14 @@ static inline void memcomp_count_initial_compress(void)
 }
 
 static inline void memcomp_count_normal_swap_fallback(void)
+{
+}
+
+static inline void memcomp_reclaim_writeback_begin(int nid, int reclaim_idx)
+{
+}
+
+static inline void memcomp_reclaim_writeback_end(int nid)
 {
 }
 
@@ -334,6 +352,11 @@ static inline bool memcomp_entry_get(unsigned long token)
 static inline bool memcomp_entry_present(unsigned long token)
 {
 	return false;
+}
+
+static inline int memcomp_swapoff(unsigned int type)
+{
+	return 0;
 }
 
 static inline bool memcomp_store_cache(struct folio *folio,

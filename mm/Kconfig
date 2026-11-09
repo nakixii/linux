@@ -173,8 +173,9 @@ config ZSWAP_ZPOOL_DEFAULT
 config MEMCOMP
 	bool "Compress reclaimed pages in memory (memcomp)"
 	#
-	# SWAP: memcomp installs swap PTEs of its own type and uses the
-	# generic swap-entry encoding and page-table helpers.
+	# SWAP: memcomp installs swap PTEs of its own type, hooks swapoff,
+	# and writes cold payloads back through real swap.  Without it the
+	# file does not even compile.
 	#
 	# ZRAM=n: !ZRAM also permits ZRAM=m for this bool, so require it off.
 	#
@@ -200,7 +201,8 @@ config MEMCOMP
 
 	  Pages are compressed into RAM and mapped through a special
 	  non-swap PTE entry type. This does not require swap block I/O as
-	  the first storage layer.
+	  the first storage layer. When real swap is enabled, memcomp
+	  may lazily write cold compressed entries back under memory pressure.
 
 	  If unsure, say N.
 

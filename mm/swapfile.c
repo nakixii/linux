@@ -2423,6 +2423,10 @@ retry:
 	if (retval)
 		return retval;
 
+	retval = memcomp_swapoff(type);
+	if (retval)
+		return retval;
+
 	prev_mm = &init_mm;
 	mmget(prev_mm);
 

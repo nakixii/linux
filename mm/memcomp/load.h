@@ -40,6 +40,35 @@ static inline int mc16_load_page(struct memcomp_ref *ref, void *dst)
 		memset_l(dst, word, PAGE_SIZE / sizeof(unsigned long));
 		return 0;
 	}
+#ifdef CONFIG_SWAP
+	if (state == MC16_SWAPPED) {
+		struct mc16_swap_fields fields;
+		swp_entry_t swap;
+
+		if (!mc16_swap_decode(word, *view.length, &fields)) {
+			ret = -EIO;
+			goto out;
+		}
+		swap = swp_entry(fields.type, fields.swap_offset);
+		if (!swap.val) {
+			ret = -EIO;
+			goto out;
+		}
+		/* Swapoff may consume the entry's distinct owner after T drops. */
+		ret = memcomp_slot_dup(swap);
+		mutex_unlock(memcomp_lock_of(ref->token));
+		if (ret)
+			return ret == -ENOMEM ? -ENOMEM : -EIO;
+		ret = memcomp_read_swapped_page(swap, fields.packed,
+						fields.byte_offset, fields.length,
+						dst, GFP_HIGHUSER_MOVABLE |
+						     __GFP_NOWARN);
+		memcomp_slot_put(swap);
+		if (!ret)
+			memcomp_debug_inc(&memcomp_swapped_read_io);
+		return ret;
+	}
+#endif
 	if ((state != MC16_STORED && state != MC16_WRITEBACK) || !word) {
 		ret = -EIO;
 		goto out;
