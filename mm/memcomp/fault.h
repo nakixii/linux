@@ -22,6 +22,7 @@ static inline vm_fault_t mc16_load(struct vm_fault *vmf, bool *locked)
 	unsigned int nr_pages = 1, fault_index = 0, i;
 	unsigned long start_addr = vmf->address, id_start = id;
 	struct folio *folio = NULL;
+	struct mc16_user_read scope;
 	pte_t *install_pte;
 	vm_fault_t ret = 0;
 	gfp_t alloc_gfp;
@@ -112,7 +113,7 @@ fallback_alloc:
 		ret = VM_FAULT_OOM;
 		goto out_put;
 	}
-		err = mem_cgroup_charge(folio, vma->vm_mm, alloc_gfp);
+		err = mc16_user_charge(&refs[0], folio, vma->vm_mm, alloc_gfp);
 	if (err) {
 		if (nr_pages > 1) {
 			folio_put(folio);
@@ -162,6 +163,12 @@ fallback_alloc:
 			goto fallback_single;
 		}
 	}
+	err = mc16_user_refault(refs, nr_pages, folio);
+	if (err) {
+		ret = err == -EAGAIN ? 0 : VM_FAULT_SIGBUS;
+		goto out_put;
+	}
+	mc16_user_read_start(&scope, folio);
 	/* A local highmem mapping covers one page, even for a large folio. */
 	for (i = 0, err = 0; i < nr_pages; i++) {
 		dst = kmap_local_folio(folio, i * PAGE_SIZE);
@@ -170,6 +177,7 @@ fallback_alloc:
 		if (err)
 			break;
 	}
+	mc16_user_read_end(&scope);
 	if (err) {
 		if (err == -EAGAIN)
 			ret = 0;
@@ -179,6 +187,9 @@ fallback_alloc:
 			ret = memcomp_fault_sigbus_or_retry(vmf);
 		goto out_put;
 	}
+	/* A new user folio was materialized; a later PTE race does not undo it. */
+	mc16_user_major(vma->vm_mm);
+	ret = VM_FAULT_MAJOR;
 	memcomp_arch_restore(id_start, folio);
 	__folio_mark_uptodate(folio);
 	/* No T survives mc16_load_page; PTL is acquired only after it returns. */
@@ -234,7 +245,7 @@ fallback_alloc:
 	/* Each committed PTE owns a folio ref and relinquishes its token owner. */
 	for (i = 0; i < nr_pages; i++)
 		mc16_ref_put_count(&refs[i], 2);
-	return VM_FAULT_NOPAGE;
+	return VM_FAULT_NOPAGE | ret;
 
 out_unlock:
 	pte_unmap_unlock(vmf->pte, vmf->ptl);

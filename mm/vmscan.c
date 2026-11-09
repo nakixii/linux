@@ -843,7 +843,13 @@ static int __remove_mapping(struct address_space *mapping, struct folio *folio,
 	if (folio_test_swapcache(folio)) {
 		swp_entry_t swap = folio->swap;
 
+#ifdef CONFIG_MEMCOMP
+		if (reclaimed && !mapping_exiting(mapping) &&
+		    !swap_memcomp_transport_test(swp_swap_info(swap),
+					 swp_offset(swap)))
+#else
 		if (reclaimed && !mapping_exiting(mapping))
+#endif
 			shadow = workingset_eviction(folio, target_memcg);
 		__delete_from_swap_cache(folio, swap, shadow);
 		mem_cgroup_swapout(folio, swap);
@@ -1150,6 +1156,7 @@ struct memcomp_deferred {
 	struct memcomp_deferred_batch fill;
 	struct memcomp_deferred_batch busy;
 	enum memcomp_reclaim_source source;
+	struct mem_cgroup *target_memcg;
 	/* Where shrink_folio_list() puts what it frees and what it keeps. */
 	struct folio_batch *free_folios;
 	struct list_head *ret_folios;
@@ -1201,7 +1208,7 @@ static void memcomp_store_deferred(struct memcomp_deferred *d,
 		memcomp_finish_fail(folio, nr_pages);
 		goto activate;
 	}
-	if (!memcomp_release_folio(folio)) {
+	if (!memcomp_release_folio_reclaim(folio, d->target_memcg)) {
 		memcomp_finish_fail(folio, nr_pages);
 		goto keep;
 	}
@@ -1360,6 +1367,7 @@ static unsigned int shrink_folio_list(struct list_head *folio_list,
 		.busy.folios = LIST_HEAD_INIT(mc_deferred.busy.folios),
 		.source = current_is_kswapd() ? MEMCOMP_RECLAIM_KSWAPD :
 						MEMCOMP_RECLAIM_DIRECT,
+		.target_memcg = sc->target_mem_cgroup,
 		.free_folios = &free_folios,
 		.ret_folios = &ret_folios,
 		.stat = stat,
@@ -1975,7 +1983,9 @@ anon_backing_ready:
 		} else if (!mapping || !__remove_mapping(mapping, folio, true,
 #ifdef CONFIG_MEMCOMP
 							 sc->target_mem_cgroup)) {
-			if (mapping || !memcomp_release_folio(folio))
+			if (mapping ||
+			    !memcomp_release_folio_reclaim(folio,
+						   sc->target_mem_cgroup))
 #else
 							 sc->target_mem_cgroup))
 #endif

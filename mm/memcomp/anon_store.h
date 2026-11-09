@@ -199,8 +199,14 @@ mc16_anon_refresh_full(struct memcomp_reclaim_ctx **ctxp, const void *src,
 		if (ret)
 			goto state_fail;
 		mutex_lock(memcomp_lock_of(refs[i].token));
-		ret = mc16_payload_commit_locked(&refs[i], folio, nr_pages, i,
-						 &payloads[i], &tail);
+		/* Close the gate before STORED/FIFO becomes visible under this T. */
+		ret = mc16_store_begin_locked(&refs[i], folio, nr_pages, i);
+		if (!ret) {
+			ret = mc16_payload_commit_locked(&refs[i], folio, nr_pages, i,
+							 &payloads[i], &tail);
+			if (ret)
+				*mc16_shadow_ptr(&refs[i]) = 0;
+		}
 		if (!ret)
 			mc16_zero_carrier_prepare_locked(store, &refs[i], nr_pages);
 		mutex_unlock(memcomp_lock_of(refs[i].token));

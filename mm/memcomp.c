@@ -3140,6 +3140,7 @@ memcomp_arch_prepare_to_swap(struct folio *folio)
 
 /* Allocate @nr_pages consecutive tokens, skipping fragmented free ranges. */
 
+#include "memcomp/workingset_store.h"
 #include "memcomp/cache_store.h"
 #include "memcomp/cache_folio.h"
 
@@ -3278,7 +3279,7 @@ static void memcomp_writeback_slots_return(void)
  */
 static int memcomp_writeback_slot_take(swp_entry_t *swapp)
 {
-	unsigned int want;
+	unsigned int want, i;
 
 	if (!memcomp_writeback_slots_free) {
 		want = min_t(unsigned int, MEMCOMP_WRITEBACK_BATCH,
@@ -3290,6 +3291,13 @@ static int memcomp_writeback_slot_take(swp_entry_t *swapp)
 			get_swap_pages(want, memcomp_writeback_slot_pool, 0);
 		if (!memcomp_writeback_slots_free)
 			return get_nr_swap_pages() <= 0 ? -ENOSPC : -ENOMEM;
+		/* Mark the whole reservation, including slots later returned unused. */
+		for (i = 0; i < memcomp_writeback_slots_free; i++) {
+			swp_entry_t entry = memcomp_writeback_slot_pool[i];
+
+			swap_memcomp_transport_set(swp_swap_info(entry),
+						   swp_offset(entry));
+		}
 	}
 
 	*swapp = memcomp_writeback_slot_pool[--memcomp_writeback_slots_free];
@@ -3473,7 +3481,7 @@ static int memcomp_read_swapped_page(swp_entry_t swap, bool packed,
 	if (!folio)
 		return -ENOMEM;
 	if (allocated)
-		swap_read_folio(folio, NULL);
+		swap_read_folio_memcomp(folio, NULL);
 
 	folio_lock(folio);
 	if (!folio_test_uptodate(folio)) {
@@ -3895,6 +3903,7 @@ static bool memcomp_writeback_defrag_pass(void)
  * Core load - decompress one page from @entry into @dst.  Sleeps on the
  * token lock and possibly swap IO; never called under the PTE lock.
  */
+#include "memcomp/workingset_load.h"
 #include "memcomp/load.h"
 #include "memcomp/consumers.h"
 

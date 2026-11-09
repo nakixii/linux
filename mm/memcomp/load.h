@@ -19,6 +19,10 @@ static inline int mc16_load_page(struct memcomp_ref *ref, void *dst)
 		ret = -EIO;
 		goto out;
 	}
+	if (*mc16_shadow_ptr(ref) == MC16_SHADOW_PUBLISHING) {
+		ret = -EAGAIN;
+		goto out;
+	}
 	if (*view.flags & MC16_F_REFRESH_PENDING) {
 		ret = -EAGAIN;
 		goto out;

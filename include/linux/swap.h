@@ -306,6 +306,10 @@ struct swap_info_struct {
 	unsigned int	max;		/* extent of the swap_map */
 	unsigned char *swap_map;	/* vmalloc'ed array of usage counts */
 	unsigned long *zeromap;		/* kvmalloc'ed bitmap to track zero pages */
+#ifdef CONFIG_MEMCOMP
+	/* One bit per swap offset: 32 KiB for 1 GiB at 4 KiB/page. */
+	unsigned long *memcomp_transport;
+#endif
 	struct swap_cluster_info *cluster_info; /* cluster info. Only for SSD */
 	struct list_head free_clusters; /* free clusters list */
 	struct list_head full_clusters; /* full clusters list */
@@ -358,6 +362,37 @@ struct swap_info_struct {
 					   */
 };
 
+#ifdef CONFIG_MEMCOMP
+/* The caller keeps the device alive and owns the allocated swap slot. */
+static inline void swap_memcomp_transport_set(struct swap_info_struct *si,
+					      unsigned long offset)
+{
+	set_bit(offset, si->memcomp_transport);
+}
+
+static inline void swap_memcomp_transport_clear(struct swap_info_struct *si,
+						unsigned long offset,
+						unsigned int nr)
+{
+	unsigned int i;
+
+	/* Adjacent slots can be freed concurrently under different cluster locks. */
+	for (i = 0; i < nr; i++)
+		clear_bit(offset + i, si->memcomp_transport);
+}
+
+/* A locked swapcache folio holds SWAP_HAS_CACHE, so the bit is stable. */
+static inline bool swap_memcomp_transport_test(struct swap_info_struct *si,
+					       unsigned long offset)
+{
+	return test_bit(offset, si->memcomp_transport);
+}
+
+/* Only an inactive device may allocate or release its transport bitmap. */
+int swap_memcomp_transport_alloc(struct swap_info_struct *si);
+void swap_memcomp_transport_free(struct swap_info_struct *si);
+#endif
+
 static inline swp_entry_t page_swap_entry(struct page *page)
 {
 	struct folio *folio = page_folio(page);
@@ -372,6 +407,10 @@ bool workingset_test_recent(void *shadow, bool file, bool *workingset,
 				bool flush);
 void workingset_age_nonresident(struct lruvec *lruvec, unsigned long nr_pages);
 void *workingset_eviction(struct folio *folio, struct mem_cgroup *target_memcg);
+#ifdef CONFIG_MEMCOMP
+void *workingset_memcomp_eviction(struct folio *folio,
+				  struct mem_cgroup *target_memcg);
+#endif
 void workingset_refault(struct folio *folio, void *shadow);
 void workingset_activation(struct folio *folio);
 

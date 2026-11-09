@@ -605,6 +605,44 @@ static void swap_read_folio_bdev_async(struct folio *folio,
 	submit_bio(bio);
 }
 
+#ifdef CONFIG_MEMCOMP
+static void swap_read_folio_common(struct folio *folio, struct swap_iocb **plug,
+				   struct swap_info_struct *sis, bool synchronous)
+{
+	if (swap_read_folio_zeromap(folio)) {
+		folio_unlock(folio);
+		return;
+	} else if (zswap_load(folio)) {
+		folio_unlock(folio);
+		return;
+	}
+
+	/* We have to read from slower devices. Increase zswap protection. */
+	zswap_folio_swapin(folio);
+
+	/* Select the existing filesystem or block-device read path. */
+	if (data_race(sis->flags & SWP_FS_OPS))
+		swap_read_folio_fs(folio, plug);
+	else if (synchronous)
+		swap_read_folio_bdev_sync(folio, sis);
+	else
+		swap_read_folio_bdev_async(folio, sis);
+}
+
+/* The outer memcomp user-folio read accounts for this transport operation. */
+void swap_read_folio_memcomp(struct folio *folio, struct swap_iocb **plug)
+{
+	struct swap_info_struct *sis = swp_swap_info(folio->swap);
+	bool synchronous = sis->flags & SWP_SYNCHRONOUS_IO;
+
+	VM_BUG_ON_FOLIO(!folio_test_swapcache(folio) && !synchronous, folio);
+	VM_BUG_ON_FOLIO(!folio_test_locked(folio), folio);
+	VM_BUG_ON_FOLIO(folio_test_uptodate(folio), folio);
+
+	swap_read_folio_common(folio, plug, sis, synchronous);
+}
+#endif
+
 void swap_read_folio(struct folio *folio, struct swap_iocb **plug)
 {
 	struct swap_info_struct *sis = swp_swap_info(folio->swap);
@@ -628,6 +666,9 @@ void swap_read_folio(struct folio *folio, struct swap_iocb **plug)
 	}
 	delayacct_swapin_start();
 
+#ifdef CONFIG_MEMCOMP
+	swap_read_folio_common(folio, plug, sis, synchronous);
+#else
 	if (swap_read_folio_zeromap(folio)) {
 		folio_unlock(folio);
 		goto finish;
@@ -648,6 +689,7 @@ void swap_read_folio(struct folio *folio, struct swap_iocb **plug)
 	}
 
 finish:
+#endif
 	if (workingset) {
 		delayacct_thrashing_end(&in_thrashing);
 		psi_memstall_leave(&pflags);

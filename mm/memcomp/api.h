@@ -121,6 +121,12 @@ bool memcomp_release_folio(struct folio *folio)
 	return mc16_release_folio(folio);
 }
 
+bool memcomp_release_folio_reclaim(struct folio *folio,
+				   struct mem_cgroup *target_memcg)
+{
+	return mc16_release_folio_reclaim(folio, target_memcg);
+}
+
 void memcomp_rollback_folio(struct folio *folio)
 {
 	mc16_rollback_folio(folio);
@@ -159,6 +165,17 @@ int memcomp_restore_resident(struct vm_fault *vmf, struct memcomp_ref *ref)
 bool memcomp_store_cache(struct folio *folio, unsigned long *token)
 {
 	return mc16_store_cache_folio(folio, token);
+}
+
+void memcomp_publish_cache_eviction(struct folio *folio, struct memcomp_ref *ref)
+{
+	mc16_publish_cache_eviction(folio, ref);
+}
+
+int memcomp_charge_folio(struct memcomp_ref *ref, struct folio *folio,
+			 struct mm_struct *mm, gfp_t gfp)
+{
+	return mc16_user_charge(ref, folio, mm, gfp);
 }
 
 bool memcomp_load_folio_pin(unsigned long token, struct memcomp_ref *ref)

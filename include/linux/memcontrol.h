@@ -700,6 +700,21 @@ int mem_cgroup_hugetlb_try_charge(struct mem_cgroup *memcg, gfp_t gfp,
 int mem_cgroup_swapin_charge_folio(struct folio *folio, struct mm_struct *mm,
 				  gfp_t gfp, swp_entry_t entry);
 
+#ifdef CONFIG_MEMCOMP
+/*
+ * Caller stabilizes the source folio's memcg. Root has a real ID and needs put.
+ * Production reserve uses the checked form: an online pin failure is an error.
+ * ID 0 means disabled or already retired identity and needs no put.
+ */
+int mem_cgroup_memcomp_id_get_checked(struct folio *folio, unsigned short *id);
+unsigned short mem_cgroup_memcomp_id_get(struct folio *folio);
+/* Duplicate a nonzero, caller-pinned ID for an independently owned key. */
+bool mem_cgroup_memcomp_id_get_ref(unsigned short id);
+void mem_cgroup_memcomp_id_put(unsigned short id);
+int mem_cgroup_memcomp_charge(struct folio *folio, struct mm_struct *mm,
+			      gfp_t gfp, unsigned short id);
+#endif
+
 void mem_cgroup_swapin_uncharge_swap(swp_entry_t entry, unsigned int nr_pages);
 
 void __mem_cgroup_uncharge(struct folio *folio);
@@ -1206,6 +1221,36 @@ static inline int mem_cgroup_swapin_charge_folio(struct folio *folio,
 {
 	return 0;
 }
+
+#ifdef CONFIG_MEMCOMP
+static inline int mem_cgroup_memcomp_id_get_checked(struct folio *folio,
+						    unsigned short *id)
+{
+	*id = 0;
+	return 0;
+}
+
+static inline unsigned short mem_cgroup_memcomp_id_get(struct folio *folio)
+{
+	return 0;
+}
+
+static inline bool mem_cgroup_memcomp_id_get_ref(unsigned short id)
+{
+	return !id;
+}
+
+static inline void mem_cgroup_memcomp_id_put(unsigned short id)
+{
+}
+
+static inline int mem_cgroup_memcomp_charge(struct folio *folio,
+					    struct mm_struct *mm,
+					    gfp_t gfp, unsigned short id)
+{
+	return 0;
+}
+#endif
 
 static inline void mem_cgroup_swapin_uncharge_swap(swp_entry_t entry, unsigned int nr)
 {

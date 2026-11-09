@@ -28,7 +28,8 @@ mc16_writeback_claim_locked(struct memcomp_ref *ref,
 	struct mc16_view view;
 	u32 bytes;
 
-	if (!mc16_view_locked(ref, &view) ||
+	if (*mc16_shadow_ptr(ref) == MC16_SHADOW_PUBLISHING ||
+	    !mc16_view_locked(ref, &view) ||
 	    !mc16_flags_valid(*view.flags) ||
 	    mc16_flags_state(*view.flags) != MC16_STORED ||
 	    (*view.flags & MC16_F_RESIDENT) || !*view.word ||

@@ -132,16 +132,20 @@ static inline void mc16_invalidate_folio(struct folio *folio)
 		put_anon_vma(anon_vma);
 }
 
-/* Success leaves the source frozen at zero, owned by the caller for freeing. */
-static inline bool mc16_release_folio(struct folio *folio)
+/*
+ * Success leaves the source frozen at zero, owned by the caller for freeing.
+ * Acquire the entire span first. Every fallible test precedes eviction, and
+ * no fallible sibling/head drop is allowed beyond that point.
+ */
+static inline bool
+mc16_release_folio_reclaim(struct folio *folio, struct mem_cgroup *target_memcg)
 {
-	struct mc16_owner_tail tail = { };
-	struct anon_vma *anon_vma = NULL;
-	struct memcomp_ref head;
-	struct mc16_view view;
-	unsigned int nr, i;
+	struct memcomp_ref refs[MEMCOMP_MAX_COMPRESS_PAGES] = { };
+	struct anon_vma *anon_vma;
+	unsigned int nr, i, held = 0;
+	unsigned long opened = 0;
 	u32 token;
-	bool dropped = false;
+	void *shadow;
 
 	if (!folio_test_locked(folio) || !folio_memcomp_reserved(folio))
 		return false;
@@ -154,50 +158,94 @@ static inline bool mc16_release_folio(struct folio *folio)
 		folio->swap.val = 0;
 		return true;
 	}
-	if (!mc16_folio_geometry(folio, &token, &nr) || !mc16_get(token, &head))
+	if (!mc16_folio_geometry(folio, &token, &nr) ||
+	    folio_mapped(folio) || folio_mapping(folio) ||
+	    folio_test_lru(folio) || folio_maybe_dma_pinned(folio))
 		return false;
-	/* Resident PENDING holds reject the freeze without another T probe. */
-	if (!folio_ref_freeze(folio, 1)) {
-		mc16_ref_put(&head);
-		return false;
+	for (i = 0; i < nr; i++) {
+		if (!mc16_get(token + i, &refs[i]))
+			goto fail;
+		held++;
 	}
-	/* The still-attached head owns the record throughout sibling detach. */
-	for (i = nr; i > 1; ) {
-		struct memcomp_ref sibling;
+	for (i = 0; i < nr; i++) {
+		struct mc16_view view;
+		unsigned int state;
+		u64 *word;
+		bool valid;
+
+		mutex_lock(memcomp_lock_of(refs[i].token));
+		word = mc16_shadow_ptr(&refs[i]);
+		valid = mc16_owner_can_drop_locked(&refs[i], folio, nr, i) &&
+			mc16_view_locked(&refs[i], &view);
+		if (valid) {
+			state = mc16_flags_state(*view.flags);
+			valid = (state == MC16_STORED || state == MC16_SAMEFILL) &&
+				!(*view.flags & (MC16_F_RESIDENT |
+						MC16_F_REFRESH_PENDING)) &&
+				(!*word || *word == MC16_SHADOW_PUBLISHING);
+		}
+		if (valid && !*word) {
+			/* Legacy low-level producers still require a real exit. */
+			*word = MC16_SHADOW_PUBLISHING;
+			opened |= BIT(i);
+		}
+		mutex_unlock(memcomp_lock_of(refs[i].token));
+		if (!valid)
+			goto fail;
+	}
+	/*
+	 * A resident actor that acquired a folio ref before its gate closed
+	 * makes this freeze fail. New actors see PUBLISHING under T. OWNER
+	 * plus our guards exclude refs-zero retirement even if every PTE zaps.
+	 */
+	if (!folio_ref_freeze(folio, 1))
+		goto fail;
+
+	/* From here on the transaction cannot fail or restore the source. */
+	mutex_lock(memcomp_lock_of(token));
+	anon_vma = mc16_span_take_anon_vma_locked(&refs[0], folio, nr);
+	mutex_unlock(memcomp_lock_of(token));
+	shadow = mc16_store_eviction(folio, target_memcg);
+	/* Detach head last, retaining every slot guard through publication. */
+	for (i = nr; i; ) {
+		struct mc16_owner_tail tail = { };
 
 		i--;
-		if (mc16_get(token + i, &sibling) &&
-		    !mc16_owner_drop_folio_held(&sibling, folio, nr, i)) {
-			mc16_ref_put(&head);
-			folio_ref_unfreeze(folio, 1);
-			return false;
+		mutex_lock(memcomp_lock_of(refs[i].token));
+		mc16_owner_detach_locked(&refs[i], &tail);
+		mutex_unlock(memcomp_lock_of(refs[i].token));
+		/* Only OWNER is retired here; keep the full-span lookup guards. */
+		{
+			struct memcomp_ref owner = refs[i];
+
+			mc16_ref_put(&owner);
 		}
+		mc16_owner_tail_put(&tail);
 	}
-	mutex_lock(memcomp_lock_of(token));
-	if (mc16_owner_matches_locked(&head, folio, nr, 0) &&
-	    mc16_view_locked(&head, &view) && mc16_flags_valid(*view.flags) &&
-	    mc16_flags_state(*view.flags) != MC16_PENDING &&
-	    !(*view.flags & MC16_F_RESIDENT)) {
-		dropped = mc16_owner_drop_locked(&head, folio, nr, 0, &tail);
-		/* The detach tail owns this member until its final put below. */
-		if (dropped && tail.record &&
-		    (tail.record->record_flags & MC16_RECORD_ANON_VMA)) {
-			anon_vma = tail.record->anon_vma;
-			tail.record->anon_vma = NULL;
-			tail.record->record_flags &= ~MC16_RECORD_ANON_VMA;
-		}
-	}
-	mutex_unlock(memcomp_lock_of(token));
-	mc16_ref_put_count(&head, dropped ? 2 : 1);
-	mc16_owner_tail_put(&tail);
+	mc16_store_publish(refs, nr, shadow);
+	for (i = 0; i < nr; i++)
+		mc16_ref_put(&refs[i]);
 	if (anon_vma)
 		put_anon_vma(anon_vma);
-	if (!dropped) {
-		folio_ref_unfreeze(folio, 1);
-		return false;
-	}
 	folio->swap.val = 0;
 	return true;
+fail:
+	for (i = 0; i < held; i++) {
+		if (opened & BIT(i)) {
+			mutex_lock(memcomp_lock_of(refs[i].token));
+			*mc16_shadow_ptr(&refs[i]) = 0;
+			mutex_unlock(memcomp_lock_of(refs[i].token));
+		}
+		mc16_ref_put(&refs[i]);
+	}
+	/* Prepared payload gates live until the caller's rollback/retry. */
+	return false;
+}
+
+/* Compatibility API, not a test bypass: NULL is stock's global reclaim. */
+static inline bool mc16_release_folio(struct folio *folio)
+{
+	return mc16_release_folio_reclaim(folio, NULL);
 }
 
 /* OWNER + this probe's lookup is two, including the borrowed head lookup. */

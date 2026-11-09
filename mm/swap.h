@@ -12,6 +12,10 @@ struct mempolicy;
 int sio_pool_init(void);
 struct swap_iocb;
 void swap_read_folio(struct folio *folio, struct swap_iocb **plug);
+#ifdef CONFIG_MEMCOMP
+/* Transport I/O: the user-folio caller owns PSI and delay accounting. */
+void swap_read_folio_memcomp(struct folio *folio, struct swap_iocb **plug);
+#endif
 void __swap_read_unplug(struct swap_iocb *plug);
 static inline void swap_read_unplug(struct swap_iocb *plug)
 {

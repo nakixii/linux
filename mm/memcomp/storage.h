@@ -45,6 +45,8 @@
 #define MC16_KEY_HASH_BITS	8
 #define MC16_CLUSTER_AGED	BIT(0)
 #define MC16_AGING_BATCH	32
+/* A private non-value marker; never insert it into an XArray. */
+#define MC16_SHADOW_PUBLISHING	2ULL
 
 struct mc16_key;
 
@@ -64,6 +66,7 @@ struct mc16_cluster {
 	u64 metadata_bytes;
 	u8 segment_live[MC16_SEGMENTS];
 	u8 reserved[8];
+	u64 *shadows[MC16_SEGMENTS];
 };
 
 enum mc16_key_kind {
@@ -78,6 +81,7 @@ struct mc16_key {
 	u64 metadata_bytes;
 	u32 clusters;		/* X protected, including queued header callbacks. */
 	u16 nid;
+	unsigned short owner_id;
 	u8 kind;
 	u8 zero_hint;
 };
@@ -85,9 +89,10 @@ struct mc16_key {
 struct mc16_segment_retire {
 	struct rcu_head rcu;
 	struct mc16_slot *segment;
+	u64 *shadows;
 };
 
-static_assert(sizeof(struct mc16_cluster) == 128);
+static_assert(sizeof(struct mc16_cluster) == 192);
 static_assert(offsetof(struct mc16_cluster, segments) == 0);
 static_assert(offsetof(struct mc16_cluster, key) == 64);
 static_assert(offsetof(struct mc16_cluster, fifo) == 72);
@@ -101,14 +106,18 @@ static_assert(offsetof(struct mc16_cluster, eligible_slots) == 102);
 static_assert(offsetof(struct mc16_cluster, metadata_bytes) == 104);
 static_assert(offsetof(struct mc16_cluster, segment_live) == 112);
 static_assert(offsetof(struct mc16_cluster, reserved) == 120);
+static_assert(offsetof(struct mc16_cluster, shadows) == 128);
 static_assert(sizeof(struct memcomp_ref) == 24);
 static_assert(MC16_SEGMENT_SLOTS * sizeof(struct mc16_slot) == 1024);
+static_assert(MC16_SEGMENT_SLOTS * sizeof(u64) == 512);
+static_assert(!(MC16_SHADOW_PUBLISHING & 1));
 
 enum mc16_storage_class {
 	MC16_META_SEGMENT,
 	MC16_META_CLUSTER,
 	MC16_META_KEY,
 	MC16_META_DESCRIPTOR,
+	MC16_META_SHADOW,
 	MC16_META_CLASSES,
 };
 
@@ -269,26 +278,52 @@ static inline void *mc16_alloc_zero(enum mc16_storage_class type,
 	return ptr;
 }
 
+/*
+ * A request owns a temporary source ID reference across X1/X2. Each key takes
+ * another reference, independent of objcg reparenting and the request lifetime.
+ */
+static inline int mc16_source_id_get(struct folio *folio, unsigned short *id)
+{
+	return mem_cgroup_memcomp_id_get_checked(folio, id);
+}
+
+static inline bool mc16_owner_id_get_ref(unsigned short id)
+{
+	return mem_cgroup_memcomp_id_get_ref(id);
+}
+
+static inline void mc16_owner_id_put(unsigned short id)
+{
+	mem_cgroup_memcomp_id_put(id);
+}
+
 /* Caller holds mc16_clusters.xa_lock for every key/current operation. */
+static inline unsigned long
+mc16_key_tag_id(struct obj_cgroup *objcg, unsigned int nid, u8 kind,
+		bool zero_hint, unsigned short owner_id)
+{
+	return (unsigned long)objcg ^ ((unsigned long)nid << 1) ^ kind ^
+		((unsigned long)zero_hint << 3) ^ ((unsigned long)owner_id << 4);
+}
+
 static inline unsigned long mc16_key_tag(struct obj_cgroup *objcg,
 					 unsigned int nid, u8 kind,
 					 bool zero_hint)
 {
-	return (unsigned long)objcg ^ ((unsigned long)nid << 1) ^ kind ^
-		((unsigned long)zero_hint << 3);
+	return mc16_key_tag_id(objcg, nid, kind, zero_hint, 0);
 }
 
 static inline struct mc16_key *
-mc16_key_find(struct obj_cgroup *objcg, unsigned int nid, u8 kind,
-	      bool zero_hint)
+mc16_key_find_id(struct obj_cgroup *objcg, unsigned int nid, u8 kind,
+		 bool zero_hint, unsigned short owner_id)
 {
 	struct mc16_key *key;
-	unsigned long tag = mc16_key_tag(objcg, nid, kind, zero_hint);
+	unsigned long tag = mc16_key_tag_id(objcg, nid, kind, zero_hint, owner_id);
 
 	lockdep_assert_held(&mc16_clusters.xa_lock);
 	hash_for_each_possible(mc16_keys, key, node, tag) {
 		if (key->objcg == objcg && key->nid == nid && key->kind == kind &&
-		    key->zero_hint == zero_hint)
+		    key->zero_hint == zero_hint && key->owner_id == owner_id)
 			return key;
 	}
 	return NULL;
@@ -308,8 +343,8 @@ static inline struct mc16_key *mc16_key_zalloc(void)
 
 /* Key slab is manually charged, with one independent test-aware objcg hold. */
 static inline struct mc16_key *
-mc16_key_alloc(struct obj_cgroup *objcg, unsigned int nid, u8 kind,
-	       bool zero_hint)
+mc16_key_alloc_id(struct obj_cgroup *objcg, unsigned int nid, u8 kind,
+		  bool zero_hint, unsigned short owner_id)
 {
 	struct mc16_key *key;
 	int ret;
@@ -319,10 +354,16 @@ mc16_key_alloc(struct obj_cgroup *objcg, unsigned int nid, u8 kind,
 		return ERR_PTR(-ENOMEM);
 	mc16_meta_alloc(MC16_META_KEY, key);
 	key->metadata_bytes = ksize(key);
+	if (!mc16_owner_id_get_ref(owner_id)) {
+		mc16_meta_free(MC16_META_KEY, key);
+		return ERR_PTR(-ENOENT);
+	}
+	key->owner_id = owner_id;
 	if (objcg) {
 		ret = memcomp_objcg_charge(objcg, GFP_NOIO | __GFP_NOWARN,
 					   key->metadata_bytes);
 		if (ret) {
+			mc16_owner_id_put(owner_id);
 			mc16_meta_free(MC16_META_KEY, key);
 			return ERR_PTR(ret);
 		}
@@ -333,6 +374,14 @@ mc16_key_alloc(struct obj_cgroup *objcg, unsigned int nid, u8 kind,
 	key->kind = kind;
 	key->zero_hint = zero_hint;
 	return key;
+}
+
+/* Legacy storage fixtures use an unrecorded ID, not root's real ID. */
+static inline struct mc16_key *
+mc16_key_alloc(struct obj_cgroup *objcg, unsigned int nid, u8 kind,
+	       bool zero_hint)
+{
+	return mc16_key_alloc_id(objcg, nid, kind, zero_hint, 0);
 }
 
 static inline void mc16_key_free(struct mc16_key *key)
@@ -346,6 +395,7 @@ static inline void mc16_key_free(struct mc16_key *key)
 		memcomp_objcg_uncharge(objcg, key->metadata_bytes);
 		memcomp_objcg_put(objcg);
 	}
+	mc16_owner_id_put(key->owner_id);
 	mc16_meta_free(MC16_META_KEY, key);
 }
 
@@ -389,12 +439,37 @@ out:
 	return found;
 }
 
+/*
+ * A guard (or an unpublished reservation) pins both arrays. Only T permits
+ * reading/writing the returned word; it must not escape that critical section.
+ */
+static inline u64 *mc16_shadow_ptr(const struct memcomp_ref *ref)
+{
+	unsigned int index, seg;
+
+	if (WARN_ON_ONCE(!ref || !ref->slot || !ref->cluster))
+		return NULL;
+	lockdep_assert_held(memcomp_lock_of(ref->token));
+	index = ref->token & (MC16_CLUSTER_SLOTS - 1);
+	seg = index >> MC16_SEGMENT_SHIFT;
+	if (WARN_ON_ONCE(!ref->cluster->shadows[seg]))
+		return NULL;
+	return &ref->cluster->shadows[seg][index & (MC16_SEGMENT_SLOTS - 1)];
+}
+
+/* The key identity is immutable and survives every held guard. */
+static inline unsigned short mc16_owner_id(const struct memcomp_ref *ref)
+{
+	return ref->cluster->key->owner_id;
+}
+
 static inline void mc16_segment_rcu_free(struct rcu_head *rcu)
 {
 	struct mc16_segment_retire *retired;
 
 	retired = container_of(rcu, struct mc16_segment_retire, rcu);
 	mc16_meta_free(MC16_META_SEGMENT, retired->segment);
+	mc16_meta_free(MC16_META_SHADOW, retired->shadows);
 	mc16_meta_free(MC16_META_DESCRIPTOR, retired);
 }
 
@@ -407,8 +482,10 @@ static inline void mc16_cluster_rcu_free(struct rcu_head *rcu)
 
 	cluster = container_of(rcu, struct mc16_cluster, rcu);
 	key = cluster->key;
-	for (i = 0; i < MC16_SEGMENTS; i++)
+	for (i = 0; i < MC16_SEGMENTS; i++) {
 		mc16_meta_free(MC16_META_SEGMENT, cluster->segments[i]);
+		mc16_meta_free(MC16_META_SHADOW, cluster->shadows[i]);
+	}
 	mc16_meta_free(MC16_META_CLUSTER, cluster);
 
 	/* A queued header still owns its key until this exact transaction. */
@@ -643,8 +720,10 @@ static inline void mc16_retire_slot(struct memcomp_ref *ref)
 		if (retired) {
 			mc16_meta_alloc(MC16_META_DESCRIPTOR, retired);
 			retired->segment = segment;
+			retired->shadows = cluster->shadows[seg];
 			/* Old RCU readers retain permanently zero refs until grace. */
 			smp_store_release(&cluster->segments[seg], NULL);
+			cluster->shadows[seg] = NULL;
 		} else {
 #ifdef CONFIG_MEMCOMP_DEBUG_STATS
 			this_cpu_inc(mc16_storage_debug.descriptor_failures);
@@ -702,6 +781,7 @@ struct mc16_reserve_request {
 	struct obj_cgroup *objcg;
 	unsigned int nid;
 	unsigned int nr;
+	unsigned short owner_id;
 	u8 kind;
 	bool zero_hint;
 };
@@ -764,6 +844,7 @@ mc16_reserve_request(const struct mc16_reserve_request *request,
 	struct mc16_cluster *cluster = NULL, *spare_cluster = NULL;
 	struct mc16_cluster *replaced = NULL;
 	struct mc16_slot *spare_segment = NULL;
+	u64 *spare_shadows = NULL;
 	struct mc16_key *key, *spare_key = NULL;
 	struct obj_cgroup *objcg = request->objcg;
 	unsigned int nr = request->nr, nid = request->nid;
@@ -772,13 +853,15 @@ mc16_reserve_request(const struct mc16_reserve_request *request,
 	unsigned long irqflags;
 	bool new_cluster, new_key, reserved = false;
 	u8 kind = request->kind;
+	unsigned short owner_id = request->owner_id;
 	int ret = 0;
 	void *old;
 
 	memset(refs, 0, sizeof(*refs) * nr);
 
 	xa_lock_irqsave(&mc16_clusters, irqflags);
-	key = mc16_key_find(objcg, nid, kind, request->zero_hint);
+	key = mc16_key_find_id(objcg, nid, kind, request->zero_hint,
+			       owner_id);
 	cluster = key ? key->current_cluster : NULL;
 	if (mc16_range(cluster, nr, &index)) {
 		seg = index >> MC16_SEGMENT_SHIFT;
@@ -818,6 +901,12 @@ mc16_reserve_request(const struct mc16_reserve_request *request,
 		ret = -ENOMEM;
 		goto recheck;
 	}
+	spare_shadows = mc16_alloc_zero(MC16_META_SHADOW,
+					MC16_SEGMENT_SLOTS * sizeof(*spare_shadows), objcg);
+	if (!spare_shadows) {
+		ret = -ENOMEM;
+		goto recheck;
+	}
 	if (new_cluster) {
 		spare_cluster = mc16_alloc_zero(MC16_META_CLUSTER,
 						sizeof(*spare_cluster), objcg);
@@ -829,8 +918,8 @@ mc16_reserve_request(const struct mc16_reserve_request *request,
 		INIT_LIST_HEAD(&spare_cluster->fifo);
 	}
 	if (new_key) {
-		spare_key = mc16_key_alloc(objcg, nid, kind,
-					   request->zero_hint);
+		spare_key = mc16_key_alloc_id(objcg, nid, kind,
+					      request->zero_hint, owner_id);
 		if (IS_ERR(spare_key)) {
 			ret = PTR_ERR(spare_key);
 			spare_key = NULL;
@@ -840,7 +929,8 @@ recheck:
 	xa_lock_irqsave(&mc16_clusters, irqflags);
 	if (ret)
 		goto cancel;
-	key = mc16_key_find(objcg, nid, kind, request->zero_hint);
+	key = mc16_key_find_id(objcg, nid, kind, request->zero_hint,
+			       owner_id);
 	cluster = key ? key->current_cluster : NULL;
 	/* Reject competing consumption/retirement without another allocation. */
 	if ((cluster ? cluster->id : 0) != target_id ||
@@ -877,8 +967,8 @@ recheck:
 		spare_cluster = NULL;
 		if (key == spare_key) {
 			hash_add(mc16_keys, &key->node,
-				 mc16_key_tag(objcg, nid, kind,
-					      request->zero_hint));
+				 mc16_key_tag_id(objcg, nid, kind,
+						 request->zero_hint, owner_id));
 			spare_key = NULL;
 		}
 		key->clusters++;
@@ -890,6 +980,9 @@ recheck:
 		index = 0;
 	}
 	seg = index >> MC16_SEGMENT_SHIFT;
+	/* Publish the zeroed shadow array before either lookup publication. */
+	cluster->shadows[seg] = spare_shadows;
+	spare_shadows = NULL;
 	/* Pair with lookup acquire; only new, zeroed storage is installed. */
 	smp_store_release(&cluster->segments[seg], spare_segment);
 	spare_segment = NULL;
@@ -902,6 +995,7 @@ cancel:
 	xa_unlock_irqrestore(&mc16_clusters, irqflags);
 	/* Unpublished resources only; source/payload ownership stays with caller. */
 	mc16_meta_free(MC16_META_SEGMENT, spare_segment);
+	mc16_meta_free(MC16_META_SHADOW, spare_shadows);
 	mc16_meta_free(MC16_META_CLUSTER, spare_cluster);
 	mc16_key_free(spare_key);
 	if (replaced)
@@ -915,18 +1009,25 @@ static inline int mc16_reserve_hint(struct mc16_record *record, unsigned int nr,
 				    struct memcomp_ref refs[])
 {
 	struct mc16_reserve_request request;
+	unsigned short owner_id;
+	int ret;
 
 	if (!record || !refs || !record->producer || !nr ||
 	    nr > MC16_MAX_PAGES || !is_power_of_2(nr) ||
 	    record->nr_pages != nr ||
 	    kind != !!(record->record_flags & MC16_RECORD_SHMEM))
 		return -EINVAL;
+	ret = mc16_source_id_get(record->producer, &owner_id);
+	if (ret)
+		return ret;
 	request = (struct mc16_reserve_request) {
-		.record = record, .objcg = record->objcg,
+		.record = record, .objcg = record->objcg, .owner_id = owner_id,
 		.nid = record->nid, .nr = nr, .kind = kind,
 		.zero_hint = zero_hint,
 	};
-	return mc16_reserve_request(&request, refs);
+	ret = mc16_reserve_request(&request, refs);
+	mem_cgroup_memcomp_id_put(owner_id);
+	return ret;
 }
 
 static inline int mc16_reserve(struct mc16_record *record, unsigned int nr,
@@ -938,7 +1039,8 @@ static inline int mc16_reserve(struct mc16_record *record, unsigned int nr,
 /*
  * Direct SHMEM cache ownership: no record, resident folio hold or lookup ref.
  * Caller holds objcg (NULL for root), zs handles and exact bytes charges before
- * entry, keeps objcg alive until return, and keeps payloads immutable throughout.
+ * entry, keeps objcg and owner_id alive until return, and keeps payloads immutable.
+ * The ID is borrowed; a new key takes its own reference. ID 0 needs no hold.
  * Validate the entire span before X1: no error may follow partial publication.
  * bytes == 0 is a full-width SAMEFILL word; otherwise word is a nonzero zs handle.
  * Success transfers payload/charge ownership to stable slots, backed by the key's
@@ -950,9 +1052,10 @@ static inline int mc16_reserve(struct mc16_record *record, unsigned int nr,
  * private reservation or confuse its initial zero with a retired index.
  */
 static inline int
-mc16_reserve_cache(struct obj_cgroup *objcg, unsigned int nid,
-		   const struct mc16_initial_payload payloads[],
-		   unsigned int nr, struct memcomp_ref refs[])
+mc16_reserve_cache_id(struct obj_cgroup *objcg, unsigned short owner_id,
+		      unsigned int nid,
+		      const struct mc16_initial_payload payloads[],
+		      unsigned int nr, struct memcomp_ref refs[])
 {
 	struct mc16_reserve_request request;
 	unsigned int i, order, state;
@@ -971,11 +1074,23 @@ mc16_reserve_cache(struct obj_cgroup *objcg, unsigned int nid,
 			return -EINVAL;
 	}
 	request = (struct mc16_reserve_request) {
-		.payloads = payloads, .objcg = objcg,
+		.payloads = payloads, .objcg = objcg, .owner_id = owner_id,
 		.nid = nid, .nr = nr, .kind = MC16_KEY_SHMEM,
 		.zero_hint = false,
 	};
 	return mc16_reserve_request(&request, refs);
+}
+
+/*
+ * Compatibility for storage-only fixtures. Production cache callers pass a
+ * source-folio ID via mc16_reserve_cache_id(), held until reserve returns.
+ */
+static inline int
+mc16_reserve_cache(struct obj_cgroup *objcg, unsigned int nid,
+		   const struct mc16_initial_payload payloads[],
+		   unsigned int nr, struct memcomp_ref refs[])
+{
+	return mc16_reserve_cache_id(objcg, 0, nid, payloads, nr, refs);
 }
 
 #endif /* _MM_MEMCOMP_STORAGE_H */
