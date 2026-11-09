@@ -663,29 +663,43 @@ static void memcomp_zs_free(u8 pool_idx, unsigned long handle)
 
 static struct obj_cgroup *memcomp_objcg_get(struct folio *folio)
 {
-	/* Compressed objects do not have an accounting owner yet. */
-	return NULL;
+	return get_obj_cgroup_from_folio(folio);
 }
 
 /* Hold an additional metadata owner without bypassing the test model. */
 static __maybe_unused void memcomp_objcg_get_ref(struct obj_cgroup *objcg)
 {
-	/* No accounting owner was acquired. */
+#ifdef CONFIG_MEMCG
+	if (objcg)
+		obj_cgroup_get(objcg);
+#endif
 }
 
 static void memcomp_objcg_put(struct obj_cgroup *objcg)
 {
-	/* No accounting owner was acquired. */
+	obj_cgroup_put(objcg);
 }
 
 static int memcomp_objcg_charge(struct obj_cgroup *objcg, gfp_t gfp,
 				size_t size)
 {
+#if defined(CONFIG_MEMCG)
+	if (!objcg || !size)
+		return 0;
+
+	return obj_cgroup_charge(objcg, gfp, size);
+#else
 	return 0;
+#endif
 }
 
 static void memcomp_objcg_uncharge(struct obj_cgroup *objcg, size_t size)
 {
+#if defined(CONFIG_MEMCG)
+	if (!objcg || !size)
+		return;
+	obj_cgroup_uncharge(objcg, size);
+#endif
 }
 
 #include "memcomp/format.h"
