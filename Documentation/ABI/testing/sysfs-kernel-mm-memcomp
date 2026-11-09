@@ -1,0 +1,363 @@
+What:		/sys/kernel/mm/memcomp/stat
+Date:		July 2026
+Contact:	Linux memory management mailing list <linux-mm@kvack.org>
+Description:
+		Read-only memcomp capacity counters.  The three decimal
+		fields are logical stored bytes, compressed payload bytes, and
+		zsmalloc pool bytes, in that order.  A pending logical page is
+		still resident and must not be treated as committed capacity.
+
+		Slotless zero tokens contribute one base page per logical owner.
+		Anonymous PTEs and shmem page-cache shadows have independent
+		ownership counts. Fork adds a zero PTE owner; fault, zap and
+		MADV_FREE remove it. Moving a zero PTE does not change the count.
+		A present shmem mapping adds no owner beyond its cache shadow.
+		Positive slots retain the per-slot counting convention, so fork
+		can increase the logical zero capacity without allocating any
+		entry metadata. Counter fields remain observational snapshots.
+
+What:		/sys/kernel/mm/memcomp/compressor
+Date:		July 2026
+Contact:	Linux memory management mailing list <linux-mm@kvack.org>
+Description:
+		Read-only name of the compression algorithm selected at boot.
+		While memcomp is still waiting for a compressor that has
+		not registered yet, this is the name it waits for; it changes
+		to "zstd" if memcomp falls back to that.
+
+What:		/sys/kernel/mm/memcomp/events
+Date:		July 2026
+Contact:	Linux memory management mailing list <linux-mm@kvack.org>
+Description:
+		Present only when CONFIG_MEMCOMP_DEBUG_STATS=y.
+
+		Read-only text with one key, one space, a decimal value and a
+		newline per line. Reading does not reset statistics. Values are
+		collected independently, so a read is not a coherent snapshot
+		against concurrent work.
+
+		The ``folio_owner_pages``, ``samefill_pages``, ``raw_pages`` and
+		``shmem_pages`` fields are current entry-state gauges. They count
+		entries with a retained folio owner, same-filled payloads, page-sized
+		raw payloads and shmem ownership, respectively. Owner detachment
+		and payload replacement update the corresponding gauge;
+		entry removal subtracts its remaining state before payload release.
+		These are sums of signed per-CPU values, not an object index or a
+		transactional snapshot. Cross-CPU reads may race concurrent updates;
+		negative aggregate samples are clamped to zero. Compare quiescent
+		samples when checking balanced ownership.
+
+		Event counters accumulate; they are not instantaneous state. The
+		other current gauges are: ``enabled``, ``comp_ctx_count``,
+		``comp_ctx_reserved``, ``comp_ctx_borrow_limit``, ``comp_ctx_free``,
+		``comp_ctx_waiters``, ``comp_ctx_borrowed_active``, ``pending_pages``,
+		``swapped_entries`` and ``zs_huge_class_size``. ``enabled`` is 1
+		when memcomp is enabled and 0 otherwise. ``zs_huge_class_size`` is
+		the request boundary, in bytes, below which zsmalloc can share
+		backing pages; zero means memcomp is not enabled or no allocator
+		pool is initialized.
+
+		``comp_ctx_borrowed_peak`` is the largest recorded count of
+		simultaneously borrowed compression contexts, not current
+		occupancy. ``comp_ctx_count`` and ``comp_ctx_reserved`` report
+		the initialized compression-context pool sizes.
+
+		``swapped_read_io`` counts successful read/decode calls for
+		swap-backed pages, including calls satisfied from swapcache; it is
+		not a physical I/O count or proof of a later PTE mapping. ``swapped_read_error`` counts read-page or decode
+		failures. ``swapoff_entries`` counts entries successfully converted
+		back to RAM backing. ``swapoff_read_io`` counts successful read-page
+		operations in that conversion path. These four fields are
+		accumulated events, not current gauges.
+
+		Compression staging and reservation rollback/split diagnostics are
+		reported by ``execution_events``, not by this file.
+
+What:		/sys/kernel/mm/memcomp/placement_events
+Date:		July 2026
+Contact:	Linux memory management mailing list <linux-mm@kvack.org>
+Description:
+		Present only when CONFIG_MEMCOMP_DEBUG_STATS=y.
+
+		Read-only text with one key, one space, a decimal value and a
+		newline per line. Reading does not reset statistics. Values are
+		collected separately and do not form a coherent whole-file snapshot.
+
+		Accumulated routing-attempt counts: ``compress`` counts attempts to
+		route anonymous or shmem folios to memcomp; ``normal_swap_fallback``
+		counts fallback attempts to ordinary swap after a memcomp attempt.
+		These are routing events, not successful stores, reclaimed pages or
+		byte counts. An event can concern a multi-page folio; retries can
+		cause further events.
+
+What:		/sys/kernel/mm/memcomp/packed_swap_events
+Date:		July 2026
+Contact:	Linux memory management mailing list <linux-mm@kvack.org>
+Description:
+		Present only when CONFIG_MEMCOMP_DEBUG_STATS=y.
+
+		Read-only text with one key, one space, a decimal value and a
+		newline per line. Reading does not reset statistics. Values are
+		collected separately and do not form a coherent whole-file snapshot.
+
+		Compressed-pool writeback diagnostics. The following fields are
+		current gauges:
+
+		* ``writeback_pool_pages``: allocator backing footprint in base
+		  pages.
+		* ``writeback_pressure_scopes``: active reclaim writeback scopes,
+		  summed across memory nodes, including overlapping scopes.
+		* ``writeback_gate_open``: last evaluated writeback-gate state, 0
+		  for closed or 1 for open.
+
+		The remaining fields are accumulated counts:
+
+		* ``writeback_pressure_events``: node scope transitions from no
+		  active scope to an active scope.
+		* ``writeback_pressure_scans``: eligible pressure-driven writeback
+		  scan invocations.
+		* ``writeback_compression_throttled``: budget-grant episodes with
+		  effective compression feedback; this is not a count of compressor
+		  calls delayed. Feedback is effective after sufficient logical
+		  stored-byte growth when backing-byte growth is at most half that
+		  growth.
+		* ``writeback_limited_batches``: scanned batches which exhaust their
+		  node's writeback budget.
+		* ``writeback_budget_granted``: sum of payload-entry allowances
+		  granted, not bytes or completed writes.
+		* ``writeback_payloads``: payload entries successfully converted
+		  from in-pool storage to swap-backed storage.
+		* ``writeback_zs_reclaimed``: sum of observed decreases in
+		  allocator backing base pages during pressure scans, including
+		  compaction. It is not a logical-page count or exclusive
+		  attribution against concurrent pool changes.
+		* ``writeback_zs_no_progress``: pressure scans which converted
+		  payloads but observed no decrease in backing pages after
+		  compaction.
+		* ``writeback_decompress_error``: failures to decompress a payload
+		  when preparing an unpacked swap page.
+		* ``writeback_write_error``: submitted swap-page slots observed
+		  dirty after waiting for writeback, indicating write failure. This
+		  counts slots, not the payload entries within them.
+		* ``writeback_gate_opens``: recorded transitions from a closed gate
+		  to an open gate.
+		* ``writeback_packed_slots``: packed backing-page slots submitted
+		  for writeback, not successfully completed I/O.
+		* ``writeback_packed_payloads``: payload entries successfully
+		  converted to packed swap storage. Multiple payloads can share a
+		  slot.
+		* ``writeback_defrag_moved``: packed swap payload entries
+		  successfully moved back into the compressed pool by
+		  defragmentation.
+
+		Submission, conversion and page-footprint statistics have different
+		units and accounting points; they must not be equated.
+
+What:		/sys/kernel/mm/memcomp/admission_events
+Date:		July 2026
+Contact:	Linux memory management mailing list <linux-mm@kvack.org>
+Description:
+		Present only when CONFIG_MEMCOMP_DEBUG_STATS=y.
+
+		Read-only text with one key, one space, a decimal value and a
+		newline per line. Reading does not reset statistics. Values are
+		collected separately and do not form a coherent whole-file snapshot.
+
+		Accumulated direct-reclaim admission diagnostics:
+
+		``reclaim_ctx_early_reject`` counts direct-reclaim context prechecks
+		which rejected an attempt; ``reclaim_ctx_early_reject_pages`` sums
+		the associated base pages. This is a precheck result, not proof of
+		an eventual failed store.
+
+What:		/sys/kernel/mm/memcomp/context_events
+Date:		July 2026
+Contact:	Linux memory management mailing list <linux-mm@kvack.org>
+Description:
+		Present only when CONFIG_MEMCOMP_DEBUG_STATS=y.
+
+		Read-only text with one key, one space, a decimal value and a
+		newline per line. Reading does not reset statistics. Values are
+		collected separately and do not form a coherent whole-file snapshot.
+
+		Compression-context timing diagnostics. ``sample_interval`` is the
+		lease sampling period, currently 256 successful reclaim-context
+		acquisitions per context and reclaim source, with staggered initial
+		phases. Sampled values are raw measurements, not extrapolated totals
+		for all work.
+
+		``wait_events`` counts entries into the context wait path, including
+		retries, independently of lease sampling. ``wait_ns`` is accumulated
+		elapsed wait-path time in nanoseconds and ``wait_max_ns`` is its
+		largest recorded individual duration; a wait-path entry need not
+		actually sleep.
+
+		The prefixes ``direct`` and ``bg`` select direct reclaim and all
+		non-direct reclaim sources. Each prefix has the following suffixes,
+		joined with an underscore:
+
+		* ``samples`` counts accounted sampled leases; ``pages`` sums their
+		  associated base pages, not pages successfully reclaimed.
+		* ``store_samples`` counts sampled leases that reached a store
+		  attempt; ``store_success`` counts successful store outcomes among
+		  them.
+		* ``lease_ns`` is accumulated context-holding time; ``lease_max_ns``
+		  is its recorded maximum per sampled lease. A lease ends when the
+		  context is released or its output is transferred to a staging
+		  buffer; later store work may continue after it.
+		* ``pre_store_ns`` is accumulated time from lease acquisition to the
+		  beginning of a store; ``pre_store_max_ns`` is its recorded
+		  maximum. A lease that never starts a store contributes its full
+		  lease duration here.
+		* ``compress_ns`` is accumulated elapsed compression time;
+		  ``compress_max_ns`` is the maximum accumulated compression
+		  duration for one sampled lease.
+		* ``compress_cpu_ns`` is accumulated task CPU time spent in measured
+		  compression; ``compress_call_cpu_max_ns`` is the largest recorded
+		  CPU duration of a timed compression operation.
+		* ``compress_store_success_ns`` and
+		  ``compress_store_success_cpu_ns`` are elapsed and CPU
+		  compression-time totals for sampled leases whose store succeeded.
+		  ``compress_store_fail_ns`` and ``compress_store_fail_cpu_ns`` are
+		  the corresponding totals for leases without a successful store,
+		  including leases that never started one.
+		* ``zs_ns`` is accumulated measured allocator/payload-placement
+		  time; ``zs_max_ns`` is its maximum per sampled lease.
+		* ``store_other_ns`` is accumulated store elapsed time after
+		  subtracting measured compression and allocator time, floored at
+		  zero; ``store_other_max_ns`` is its maximum per sampled lease.
+
+		Each prefix additionally has ``compress_<outcome>_calls``,
+		``compress_<outcome>_ns`` and ``compress_<outcome>_cpu_ns`` for
+		``compressible``, ``raw_huge``, ``raw_ge_page`` and ``error``
+		outcomes. These count timed compression operations and accumulate
+		their elapsed and task CPU nanoseconds. The outcomes mean a result
+		below both storage boundaries, a result reaching the allocator
+		huge-class boundary but below input size, a result at least input
+		size, and a compression-result error. They are distinct from the
+		later store-success classification.
+
+		All durations are nanoseconds. Counts and duration totals
+		accumulate; maxima are recorded high-water durations, not gauges.
+		Lease and store phases must not be assumed to be a disjoint
+		decomposition of end-to-end request latency.
+
+What:		/sys/kernel/mm/memcomp/context_sources
+Date:		July 2026
+Contact:	Linux memory management mailing list <linux-mm@kvack.org>
+Description:
+		Present only when CONFIG_MEMCOMP_DEBUG_STATS=y.
+
+		Read-only text with one key, one space, a decimal value and a
+		newline per line. Reading does not reset statistics. Values are
+		collected separately and do not form a coherent whole-file snapshot.
+
+		Source-attributed context timing. ``sample_interval`` reports the
+		lease sampling period, currently 256 successful reclaim-context
+		acquisitions per context and source, with staggered initial phases.
+		Lease measurements are sampled, not extrapolated; wait-path
+		measurements are not lease-sampled.
+
+		Prefixes are ``direct`` for direct reclaim and ``kswapd`` for the
+		regular reclaim daemon. For each prefix, suffixes are joined with
+		an underscore:
+
+		* ``samples`` and ``pages`` count sampled leases and their
+		  associated base pages, not successful reclaim.
+		* ``store_samples`` and ``store_success`` count sampled store
+		  attempts and successful store outcomes.
+		* ``wait_events`` counts context wait-path entries, including
+		  retries; ``wait_ns`` sums their elapsed nanoseconds;
+		  ``wait_max_ns`` is the largest individual duration. A wait-path
+		  entry need not sleep.
+		* ``lease_ns``, ``pre_store_ns``, ``compress_ns``, ``zs_ns`` and
+		  ``store_other_ns`` are accumulated elapsed nanoseconds; each has a
+		  corresponding ``*_max_ns`` field for its recorded per-lease
+		  maximum.
+		* ``compress_cpu_ns`` is accumulated compression task CPU time;
+		  ``compress_call_cpu_max_ns`` is the maximum CPU duration of a
+		  timed compression operation.
+
+		Lease, pre-store, compression, allocator and residual store phases
+		have the same meanings as in
+		/sys/kernel/mm/memcomp/context_events. A context lease can end
+		before staged store work completes, and a lease without a store
+		contributes its full duration to pre-store time. Counts and times
+		accumulate; maxima are historical measurements, not current
+		occupancy. A read is not a consistent snapshot across source groups.
+
+What:		/sys/kernel/mm/memcomp/execution_events
+Date:		July 2026
+Contact:	Linux memory management mailing list <linux-mm@kvack.org>
+Description:
+		Present only when CONFIG_MEMCOMP_DEBUG_STATS=y.
+
+		Read-only text with one key, one space, a decimal value and a
+		newline per line. Reading does not reset statistics. Values are
+		collected separately and do not form a coherent whole-file snapshot.
+
+		Compression execution budget, staging-buffer and reservation
+		diagnostics. ``comp_budget_limit`` and
+		``comp_budget_background_limit`` report the current background
+		execution-credit limit; ``comp_budget_active`` and
+		``comp_budget_background_active`` report currently held background
+		credits. Their ``comp_budget_peak`` and
+		``comp_budget_background_peak`` fields are recorded occupancy
+		high-water counts. These are credits, not pages or all contexts in
+		use.
+
+		``comp_budget_direct_limit``, ``comp_budget_direct_active`` and
+		``comp_budget_direct_peak`` currently report zero: direct reclaim
+		does not consume these background execution credits. Zero does not
+		mean that direct compression is disabled. ``comp_budget_waiters`` is
+		the current number of registered context waiters, not only waiters
+		for budget exhaustion. Limits and occupancy are gauges; peaks can
+		restart if the associated context resources are reinitialized.
+
+		``reclaim_ctx_budget_pages`` accumulates base pages associated with
+		context misses attributed to execution-budget exhaustion.
+		``direct_budget_reject`` counts direct-reclaim precheck or
+		acquisition failures attributed to that budget;
+		``direct_budget_reject_pages`` sums their base pages.
+		``kswapd_budget_wait`` counts reclaim-daemon context wait-loop
+		attempts attributed to budget exhaustion, not slept time or unique
+		callers.
+
+		``direct_staging_count`` is the initialized number of staging
+		buffers. ``direct_staging_free`` and ``direct_staging_active`` are
+		current free and occupied buffer counts. ``direct_staging_peak`` is
+		a recorded occupancy high-water count and can restart on resource
+		reinitialization. ``direct_staging_miss`` counts unsuccessful
+		attempts to reserve a staging buffer; compression can continue
+		without staging. ``direct_staging_detach`` counts transfers of
+		output and timing state to staging that release the compression
+		context before completing the store; it does not indicate store
+		success.
+
+		Additional accumulated reservation/split diagnostics:
+
+		* ``restore_spans`` counts reservation rollbacks requiring an
+		  initial reverse-mapping restore walk; ``restore_rewalks`` counts
+		  additional walks while reservation tokens remain referenced.
+		* ``restore_ptes`` counts page-table entries mapped back to resident
+		  folio pages during those walks.
+		* ``restore_missed_pages`` sums base pages still referenced by
+		  reservation-token PTEs after those walks when the reservation is
+		  dropped. A subsequent fault restores the resident page instead.
+		* ``restore_ns`` sums elapsed reverse-mapping walk nanoseconds;
+		  ``restore_max_ns`` is the largest recorded individual walk
+		  duration.
+		* ``split_refused`` counts refused anonymous-folio splits due to a
+		  reservation; ``split_refused_pages`` sums their base pages.
+
+		Event counts and durations are accumulated statistics; gauge, limit,
+		initialized-capacity and peak fields are not interchangeable.
+		Separate locks and counter reads do not provide a coherent
+		whole-file snapshot.
+
+		``aging_work_calls`` counts retained-header aging callbacks;
+		``aging_detached_headers`` counts the empty current headers they
+		detach. Both are accumulated per-CPU events. They do not reset on
+		read and are not atomic with ``retained_empty_headers`` or the
+		metadata allocation/free gauges. Detaching queues existing RCU
+		callbacks; it does not mean those callbacks have completed.
