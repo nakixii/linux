@@ -103,6 +103,9 @@ void memcomp_entry_resident_put(struct memcomp_ref *ref);
 /* Consumes and clears the held guard on every return. */
 int memcomp_restore_resident(struct vm_fault *vmf, struct memcomp_ref *ref);
 void memcomp_invalidate(unsigned long token);
+void memcomp_invalidate_cache(unsigned long token);
+/* Called only by the winning zero-cache XA replacement while locked. */
+void memcomp_publish_cache_zero(void);
 void memcomp_invalidate_nr(unsigned long token, unsigned int nr_pages);
 void memcomp_invalidate_folio(struct folio *folio);
 bool memcomp_release_folio(struct folio *folio);
@@ -124,6 +127,30 @@ bool memcomp_entry_set_refresh_pending(unsigned long token);
 void memcomp_entry_clear_refresh_pending(unsigned long token);
 bool memcomp_entry_get(unsigned long token);
 bool memcomp_entry_present(unsigned long token);
+
+/*
+ * Page-cache variants for shmem/tmpfs pages. A zero store result prepares
+ * a value only: its winning XA replacement must publish the cache owner
+ * before unlocking. An aborted zero preparation creates no owner to drop.
+ */
+bool memcomp_store_cache(struct folio *folio, unsigned long *token);
+/*
+ * Pin rejects token0 with an empty guard. Explicit zero load consumes no
+ * owner; the winning shadow replacement drops its cache owner separately.
+ * Pin must be resolved with exactly one abort or commit call.  Commit also
+ * drops the shadow owner and is valid only after replacing the expected
+ * shadow in the page cache.  Failed pins clear the output; abort and commit
+ * consume and clear the guard.  Load keeps the guard on every return.
+ */
+bool memcomp_load_folio_pin(unsigned long token, struct memcomp_ref *ref);
+int memcomp_load_folio(struct memcomp_ref *ref, struct folio *folio);
+int memcomp_load_folio_zero(struct folio *folio);
+void memcomp_load_folio_abort(struct memcomp_ref *ref);
+void memcomp_load_folio_commit(struct memcomp_ref *ref);
+
+/* Check if a page-cache xa_value is a memcomp entry. */
+bool is_memcomp_shadow(void *shadow);
+unsigned long memcomp_shadow_token(void *shadow);
 
 #else
 
@@ -225,6 +252,14 @@ static inline void memcomp_invalidate(unsigned long token)
 {
 }
 
+static inline void memcomp_invalidate_cache(unsigned long token)
+{
+}
+
+static inline void memcomp_publish_cache_zero(void)
+{
+}
+
 static inline void memcomp_invalidate_nr(unsigned long token,
 					 unsigned int nr_pages)
 {
@@ -299,6 +334,51 @@ static inline bool memcomp_entry_get(unsigned long token)
 static inline bool memcomp_entry_present(unsigned long token)
 {
 	return false;
+}
+
+static inline bool memcomp_store_cache(struct folio *folio,
+				       unsigned long *token)
+{
+	return false;
+}
+
+static inline bool memcomp_load_folio_pin(unsigned long token,
+					  struct memcomp_ref *ref)
+{
+	*ref = (struct memcomp_ref) { };
+	return false;
+}
+
+static inline int memcomp_load_folio(struct memcomp_ref *ref,
+				     struct folio *folio)
+{
+	*ref = (struct memcomp_ref) { };
+	return -ENOENT;
+}
+
+static inline int memcomp_load_folio_zero(struct folio *folio)
+{
+	return -ENOENT;
+}
+
+static inline void memcomp_load_folio_abort(struct memcomp_ref *ref)
+{
+	*ref = (struct memcomp_ref) { };
+}
+
+static inline void memcomp_load_folio_commit(struct memcomp_ref *ref)
+{
+	*ref = (struct memcomp_ref) { };
+}
+
+static inline bool is_memcomp_shadow(void *shadow)
+{
+	return false;
+}
+
+static inline unsigned long memcomp_shadow_token(void *shadow)
+{
+	return 0;
 }
 
 #endif

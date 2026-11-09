@@ -85,6 +85,9 @@ static struct vfsmount *shm_mnt __ro_after_init;
 #include <linux/quotaops.h>
 #include <linux/rcupdate_wait.h>
 #include <linux/android_vendor.h>
+#ifdef CONFIG_MEMCOMP
+#include <linux/memcomp.h>
+#endif
 
 #include <linux/uaccess.h>
 
@@ -854,6 +857,15 @@ static void shmem_delete_from_page_cache(struct folio *folio, void *radswap)
 	xa_lock_irq(&mapping->i_pages);
 	error = shmem_replace_entry(mapping, folio->index, folio, radswap);
 	trace_android_vh_shmem_mod_shmem(folio->mapping, -nr);
+#ifdef CONFIG_MEMCOMP
+	if (!error) {
+		swp_entry_t entry = radix_to_swp_entry(radswap);
+
+		/* Publish ownership before any reader can remove this shadow. */
+		if (is_memcomp_entry(entry) && !swp_offset(entry))
+			memcomp_publish_cache_zero();
+	}
+#endif
 	folio->mapping = NULL;
 	mapping->nrpages -= nr;
 	shmem_update_stats(folio, -nr);
@@ -871,14 +883,29 @@ static long shmem_free_swap(struct address_space *mapping,
 			    pgoff_t index, void *radswap)
 {
 	int order = xa_get_order(&mapping->i_pages, index);
+#ifdef CONFIG_MEMCOMP
+	swp_entry_t entry = radix_to_swp_entry(radswap);
+	long nr_pages = is_memcomp_entry(entry) ? 1 : 1 << order;
+#endif
 	void *old;
 
 	old = xa_cmpxchg_irq(&mapping->i_pages, index, radswap, NULL, 0);
 	if (old != radswap)
 		return 0;
+#ifdef CONFIG_MEMCOMP
+	if (is_memcomp_entry(entry))
+		memcomp_invalidate_cache(swp_offset(entry));
+	else
+		free_swap_and_cache_nr(entry, nr_pages);
+#else
 	free_swap_and_cache_nr(radix_to_swp_entry(radswap), 1 << order);
+#endif
 
+#ifdef CONFIG_MEMCOMP
+	return nr_pages;
+#else
 	return 1 << order;
+#endif
 }
 
 /*
@@ -900,8 +927,23 @@ unsigned long shmem_partial_swap_usage(struct address_space *mapping,
 	xas_for_each(&xas, page, max) {
 		if (xas_retry(&xas, page))
 			continue;
+#ifdef CONFIG_MEMCOMP
+		if (xa_is_value(page)) {
+			swp_entry_t entry = radix_to_swp_entry(page);
+
+			if (is_memcomp_entry(entry)) {
+				if (memcomp_entry_stat(swp_offset(entry),
+						       NULL, NULL))
+					swapped += PAGE_SIZE;
+			} else {
+				swapped += (1UL << xas_get_order(&xas)) <<
+					   PAGE_SHIFT;
+			}
+		}
+#else
 		if (xa_is_value(page))
 			swapped += 1 << xas_get_order(&xas);
+#endif
 		if (xas.xa_index == max)
 			break;
 		if (need_resched()) {
@@ -911,7 +953,11 @@ unsigned long shmem_partial_swap_usage(struct address_space *mapping,
 	}
 	rcu_read_unlock();
 
+#ifdef CONFIG_MEMCOMP
+	return swapped;
+#else
 	return swapped << PAGE_SHIFT;
+#endif
 }
 
 /*
@@ -939,6 +985,15 @@ unsigned long shmem_swap_usage(struct vm_area_struct *vma)
 	if (!swapped)
 		return 0;
 
+#ifdef CONFIG_MEMCOMP
+	/*
+	 * info->swapped counts a memcomp entry as one page, which is what
+	 * shmem_partial_swap_usage() also reports for it, so the whole-object
+	 * answer is still exact without the walk.  Restoring this matters:
+	 * smaps_rollup is polled continuously, and the walk is an RCU pass
+	 * over every entry of the mapping with an xa_load per memcomp one.
+	 */
+#endif
 	if (!vma->vm_pgoff && vma->vm_end - vma->vm_start >= inode->i_size)
 		return swapped << PAGE_SHIFT;
 
@@ -1329,6 +1384,10 @@ static int shmem_find_swap_entries(struct address_space *mapping,
 			continue;
 
 		entry = radix_to_swp_entry(folio);
+#ifdef CONFIG_MEMCOMP
+		if (is_memcomp_entry(entry))
+			continue;
+#endif
 		/*
 		 * swapin error entries can be found in the mapping. But they're
 		 * deliberately ignored here as we've done everything we can do.
@@ -1467,7 +1526,13 @@ static int shmem_writepage(struct page *page, struct writeback_control *wbc)
 	struct shmem_sb_info *sbinfo = SHMEM_SB(inode->i_sb);
 	swp_entry_t swap;
 	pgoff_t index;
+#ifdef CONFIG_MEMCOMP
+	unsigned long mc_token;
+#endif
 	int nr_pages;
+#ifdef CONFIG_MEMCOMP
+	bool memcomp_attempted = false;
+#endif
 	bool split = false;
 
 	/*
@@ -1483,8 +1548,84 @@ static int shmem_writepage(struct page *page, struct writeback_control *wbc)
 	if (WARN_ON_ONCE((info->flags & VM_LOCKED) || sbinfo->noswap))
 		goto redirty;
 
+#ifdef CONFIG_MEMCOMP
+	/*
+	 * Only an uptodate folio.  The !uptodate handling below is what gives
+	 * shmem_fallocate() its backpressure - it counts the folio in
+	 * shmem_falloc->nr_unswapped and redirties it so the fallocation can
+	 * give up with -ENOMEM - and what zeroes a folio whose contents were
+	 * never initialised.  Jumping straight to the store skipped both, so a
+	 * fallocate that should have failed ran on to OOM, and on a kernel
+	 * booted with init_on_alloc=0 the uninitialised page became file
+	 * contents.  A folio that arrives !uptodate takes the swap path, and
+	 * the retries below reach the store once it has been made uptodate.
+	 */
+	if (memcomp_available() && !folio_test_large(folio) &&
+	    folio_test_uptodate(folio)) {
+		memcomp_count_initial_compress();
+		goto try_memcomp;
+	}
+	goto try_swap;
+
+try_memcomp:
+	memcomp_attempted = true;
+	if (!folio_test_large(folio)) {
+		if (memcomp_store_cache(folio, &mc_token)) {
+			swp_entry_t mc_entry = make_memcomp_entry(mc_token);
+
+			mutex_lock(&shmem_swaplist_mutex);
+			if (list_empty(&info->swaplist))
+				list_add(&info->swaplist, &shmem_swaplist);
+			mutex_unlock(&shmem_swaplist_mutex);
+
+			/*
+			 * Raise swapped before nrpages is lowered, as the
+			 * swap path below does.  shmem_recalc_inode()
+			 * compensates for exactly that order - see the
+			 * comment on its `swapped > 0` clause - so calling it
+			 * after shmem_delete_from_page_cache() has already
+			 * dropped nrpages makes it count the page as freed
+			 * and hand a block back that nothing released.
+			 */
+			shmem_recalc_inode(inode, 0, 1);
+			shmem_delete_from_page_cache(folio,
+						     swp_to_radix_entry(mc_entry));
+			if (folio_test_dirty(folio))
+				folio_clear_dirty(folio);
+			/*
+			 * Leave the token on the folio.  The folio now has no
+			 * mapping and one reference, and shrink_folio_list()
+			 * only credits nr_reclaimed for a folio it frees on
+			 * its free_it: path.  Its recovery arm for exactly
+			 * this shape keys on page_swap_entry(), so without a
+			 * token the folio takes keep_locked, is dropped
+			 * unaccounted by move_folios_to_lru(), and direct
+			 * reclaim reports no progress for work it did - which
+			 * __alloc_pages_slowpath() counts toward OOM.
+			 *
+			 * The entry is owned by the page-cache xarray, not by
+			 * the folio: memcomp_do_store() was passed no
+			 * owner folio, so it carries MC_SHMEM rather than
+			 * MC_OWNER and the memcomp_invalidate_folio() that
+			 * arm performs drops nothing.  This is the same
+			 * handover memcomp_reserve() makes for anonymous
+			 * folios.
+			 */
+			folio->swap = mc_entry;
+			folio_unlock(folio);
+			return 0;
+		}
+	}
+
+try_swap:
+	/* This is the regular shmem fallback, not memcomp writeback. */
+#endif
 	if (!total_swap_pages)
 		goto redirty;
+#ifdef CONFIG_MEMCOMP
+	if (memcomp_attempted)
+		memcomp_count_normal_swap_fallback();
+#endif
 
 	/*
 	 * If CONFIG_THP_SWAP is not enabled, the large folio should be
@@ -1549,6 +1690,13 @@ try_split:
 
 	swap = folio_alloc_swap(folio);
 	if (!swap.val) {
+#ifdef CONFIG_MEMCOMP
+		if (!memcomp_attempted && memcomp_available() &&
+		    !folio_test_large(folio)) {
+			memcomp_count_initial_compress();
+			goto try_memcomp;
+		}
+#endif
 		if (nr_pages > 1)
 			goto try_split;
 
@@ -1582,6 +1730,13 @@ try_split:
 
 	mutex_unlock(&shmem_swaplist_mutex);
 	put_swap_folio(folio, swap);
+#ifdef CONFIG_MEMCOMP
+	if (!memcomp_attempted && memcomp_available() &&
+	    !folio_test_large(folio)) {
+		memcomp_count_initial_compress();
+		goto try_memcomp;
+	}
+#endif
 redirty:
 	folio_mark_dirty(folio);
 	if (wbc->for_reclaim)
@@ -2125,6 +2280,89 @@ static int shmem_swapin_folio(struct inode *inode, pgoff_t index,
 
 	if (is_poisoned_swp_entry(swap))
 		return -EIO;
+#ifdef CONFIG_MEMCOMP
+
+	if (is_memcomp_entry(swap)) {
+		struct memcomp_ref mc_ref = { };
+		unsigned long token = swp_offset(swap);
+
+		if (!shmem_confirm_swap(mapping, index, swap))
+			return -EEXIST;
+
+		if (shmem_inode_acct_blocks(inode, 1))
+			return -ENOSPC;
+
+		folio = shmem_alloc_folio(gfp, 0, info, index);
+		if (!folio) {
+			shmem_inode_unacct_blocks(inode, 1);
+			return -ENOMEM;
+		}
+		__folio_set_locked(folio);
+		__folio_set_swapbacked(folio);
+		nr_pages = folio_nr_pages(folio);
+
+		error = mem_cgroup_charge(folio, fault_mm, gfp & GFP_RECLAIM_MASK);
+		if (error) {
+			shmem_inode_unacct_blocks(inode, nr_pages);
+			folio_unlock(folio);
+			folio_put(folio);
+			return error;
+		}
+
+		/*
+		 * Allocation and memcg charge may reclaim or wait for OOM.
+		 * Pin only after both, then recheck the page-cache entry.
+		 */
+		if (token)
+			memcomp_load_folio_pin(token, &mc_ref);
+		if ((token && !mc_ref.slot) ||
+		    !shmem_confirm_swap(mapping, index, swap)) {
+			shmem_inode_unacct_blocks(inode, nr_pages);
+			folio_unlock(folio);
+			folio_put(folio);
+			if (mc_ref.slot)
+				memcomp_load_folio_abort(&mc_ref);
+			return -EEXIST;
+		}
+
+		error = token ? memcomp_load_folio(&mc_ref, folio) :
+			memcomp_load_folio_zero(folio);
+		if (error) {
+			shmem_inode_unacct_blocks(inode, nr_pages);
+			folio_unlock(folio);
+			folio_put(folio);
+			if (!shmem_confirm_swap(mapping, index, swap))
+				error = -EEXIST;
+			memcomp_load_folio_abort(&mc_ref);
+			return error;
+		}
+
+		error = shmem_add_to_page_cache(folio, mapping, index,
+						swp_to_radix_entry(swap), gfp);
+		if (error) {
+			shmem_inode_unacct_blocks(inode, nr_pages);
+			folio_unlock(folio);
+			folio_put(folio);
+			memcomp_load_folio_abort(&mc_ref);
+			return error == -EEXIST ? -EEXIST : error;
+		}
+
+		shmem_recalc_inode(inode, 1, -1);
+
+		if (sgp == SGP_WRITE)
+			folio_mark_accessed(folio);
+
+		folio_mark_dirty(folio);
+		if (token)
+			memcomp_load_folio_commit(&mc_ref);
+		else
+			memcomp_invalidate_cache(0);
+		folio_add_lru(folio);
+
+		*foliop = folio;
+		return 0;
+	}
+#endif
 
 	si = get_swap_device(swap);
 	if (!si) {

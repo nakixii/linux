@@ -2234,6 +2234,35 @@ memcomp_prepare_payload_locked(struct memcomp_reclaim_ctx **ctxp,
 	return 0;
 }
 
+static int memcomp_prepare_payload(const void *src, unsigned int src_len,
+				   unsigned int *length,
+				       unsigned long *handle,
+				       u8 *pool_idx,
+				       enum memcomp_payload_mode mode,
+				       bool allow_provisional_raw)
+{
+	struct memcomp_reclaim_ctx *ctx;
+	unsigned long element;
+	int ret;
+
+	/* Same-filled shmem pages do not need a compression workspace. */
+	if (page_same_filled(src, &element)) {
+		*length = 0;
+		*handle = element;
+		return 0;
+	}
+
+	ctx = memcomp_get_comp_ctx(mode, NULL, MEMCOMP_RECLAIM_DIRECT);
+	if (!ctx)
+		return -EBUSY;
+	ret = memcomp_prepare_payload_locked(&ctx, src, src_len, length,
+					     handle, pool_idx,
+						 allow_provisional_raw, NULL);
+	WARN_ON_ONCE(!ctx);
+	memcomp_put_comp_ctx(ctx);
+	return ret;
+}
+
 static __always_inline int
 memcomp_arch_prepare_to_swap(struct folio *folio)
 {
@@ -2241,6 +2270,9 @@ memcomp_arch_prepare_to_swap(struct folio *folio)
 }
 
 /* Allocate @nr_pages consecutive tokens, skipping fragmented free ranges. */
+
+#include "memcomp/cache_store.h"
+#include "memcomp/cache_folio.h"
 
 /*
  * Core store - compress @nr_pages pages and insert them into the global
@@ -2455,6 +2487,16 @@ static bool memcomp_map_resident(struct vm_area_struct *vma,
 #endif
 
 /* Check if a page-cache xa_value is a memcomp entry. */
+bool is_memcomp_shadow(void *shadow)
+{
+	return xa_is_value(shadow) &&
+	       is_memcomp_entry(radix_to_swp_entry(shadow));
+}
+
+unsigned long memcomp_shadow_token(void *shadow)
+{
+	return swp_offset(radix_to_swp_entry(shadow));
+}
 
 /*
  * Shmem/tmpfs variant: compress a folio and return the token.  This does not
@@ -2468,6 +2510,10 @@ static bool memcomp_map_resident(struct vm_area_struct *vma,
  * abort.  The caller handles locking, page-cache insertion and rmap.
  */
 /* Explicit zero transport: no sentinel guard or owner consumption. */
+int memcomp_load_folio_zero(struct folio *folio)
+{
+	return mc16_cache_load_zero(folio);
+}
 
 /* Fill an existing token span after every mapping has been removed. */
 

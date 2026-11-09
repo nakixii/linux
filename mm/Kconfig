@@ -195,7 +195,8 @@ config MEMCOMP
 	select XXHASH
 	default n
 	help
-	  Enable direct in-memory compression for reclaimed anonymous pages.
+	  Enable direct in-memory compression for reclaimed anonymous and
+	  shmem/tmpfs pages.
 
 	  Pages are compressed into RAM and mapped through a special
 	  non-swap PTE entry type. This does not require swap block I/O as

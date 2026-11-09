@@ -29,6 +29,16 @@ void memcomp_invalidate_nr(unsigned long token, unsigned int nr)
 	mc16_pte_put_nr(token, nr);
 }
 
+void memcomp_publish_cache_zero(void)
+{
+	mc16_zero_cache_get(1);
+}
+
+void memcomp_invalidate_cache(unsigned long token)
+{
+	mc16_cache_drop(token);
+}
+
 bool memcomp_entry_present(unsigned long token)
 {
 	return mc16_entry_present(token);
@@ -146,4 +156,28 @@ int memcomp_restore_resident(struct vm_fault *vmf, struct memcomp_ref *ref)
 	return (ret & VM_FAULT_SIGBUS) ? -EFAULT : 0;
 }
 
+bool memcomp_store_cache(struct folio *folio, unsigned long *token)
+{
+	return mc16_store_cache_folio(folio, token);
+}
+
+bool memcomp_load_folio_pin(unsigned long token, struct memcomp_ref *ref)
+{
+	return mc16_cache_pin(token, ref);
+}
+
+int memcomp_load_folio(struct memcomp_ref *ref, struct folio *folio)
+{
+	return mc16_cache_load(ref, folio);
+}
+
+void memcomp_load_folio_abort(struct memcomp_ref *ref)
+{
+	mc16_cache_abort(ref);
+}
+
+void memcomp_load_folio_commit(struct memcomp_ref *ref)
+{
+	mc16_cache_commit(ref);
+}
 #endif /* _MM_MEMCOMP_API_H */
