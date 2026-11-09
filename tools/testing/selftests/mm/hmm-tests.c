@@ -10,6 +10,8 @@
  * bugs.
  */
 
+#define _FILE_OFFSET_BITS 64
+
 #include "../kselftest_harness.h"
 
 #include <errno.h>
@@ -407,6 +409,116 @@ TEST_F(hmm, anon_read_prot)
 		ASSERT_EQ(ptr[i], -i);
 
 	hmm_buffer_free(buffer);
+}
+
+/*
+ * Pagemap's swap type 30 is SWP_MEMCOMP when CONFIG_MEMCOMP is enabled:
+ * MAX_SWAPFILES + SWP_HWPOISON_NUM + SWP_MIGRATION_NUM + SWP_DEVICE_NUM.
+ * Require a real token rather than inferring compression from swap activity.
+ */
+static int hmm_memcomp_pageout(struct hmm_buffer *buffer, unsigned int page_size)
+{
+	uint64_t entry;
+	unsigned long i, npages = buffer->size / page_size;
+	unsigned int attempt, compressed;
+	ssize_t ret;
+	int fd, error = 0;
+
+	fd = open("/proc/self/pagemap", O_RDONLY);
+	if (fd < 0)
+		return -errno;
+
+	for (attempt = 0; attempt < 50; attempt++) {
+		if (madvise(buffer->ptr, buffer->size, MADV_PAGEOUT)) {
+			error = -errno;
+			break;
+		}
+		compressed = 0;
+		for (i = 0; i < npages; i++) {
+			off_t offset = ((uintptr_t)buffer->ptr / page_size + i) *
+				       sizeof(entry);
+
+			do {
+				ret = pread(fd, &entry, sizeof(entry), offset);
+			} while (ret < 0 && errno == EINTR);
+			if (ret != sizeof(entry)) {
+				error = ret < 0 ? -errno : -EIO;
+				goto out;
+			}
+			if (!(entry & (1ULL << 63)) &&
+			    (entry & (1ULL << 62)) && (entry & 31) == 30)
+				compressed++;
+		}
+		if (compressed) {
+			error = compressed;
+			break;
+		}
+		hmm_nanosleep(20000000);
+	}
+out:
+	close(fd);
+	return error;
+}
+
+/* Exercise both HMM read and write faults on actual memcomp tokens. */
+TEST_F(hmm, memcomp_read_write)
+{
+	struct hmm_buffer buffer = { .fd = -1 };
+	unsigned char *ptr;
+	unsigned long i, npages = 256;
+	int ret;
+
+	if (access("/sys/kernel/mm/memcomp", F_OK))
+		SKIP(return, "memcomp is not available");
+
+	buffer.size = npages * self->page_size;
+	buffer.mirror = malloc(buffer.size);
+	ASSERT_NE(buffer.mirror, NULL);
+	buffer.ptr = mmap(NULL, buffer.size, PROT_READ | PROT_WRITE,
+			  MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	ASSERT_NE(buffer.ptr, MAP_FAILED);
+	ASSERT_EQ(madvise(buffer.ptr, buffer.size, MADV_NOHUGEPAGE), 0);
+	ptr = buffer.ptr;
+	for (i = 0; i < buffer.size; i++)
+		ptr[i] = 1 + (i % 64);
+
+	ret = hmm_memcomp_pageout(&buffer, self->page_size);
+	if (ret <= 0) {
+		munmap(buffer.ptr, buffer.size);
+		free(buffer.mirror);
+		if (ret == 0 || ret == -EACCES || ret == -EPERM)
+			SKIP(return, "no observable memcomp tokens: %d", ret);
+		ASSERT_GT(ret, 0);
+	}
+	TH_LOG("read fault covers %d compressed pages", ret);
+	ASSERT_EQ(hmm_dmirror_cmd(self->fd, HMM_DMIRROR_READ,
+				  &buffer, npages), 0);
+	ASSERT_EQ(buffer.cpages, npages);
+	ptr = buffer.mirror;
+	for (i = 0; i < buffer.size; i++)
+		ASSERT_EQ(ptr[i], 1 + (i % 64));
+
+	ret = hmm_memcomp_pageout(&buffer, self->page_size);
+	if (ret <= 0) {
+		munmap(buffer.ptr, buffer.size);
+		free(buffer.mirror);
+		if (ret == 0 || ret == -EACCES || ret == -EPERM)
+			SKIP(return, "no observable tokens for write: %d", ret);
+		ASSERT_GT(ret, 0);
+	}
+	TH_LOG("write fault covers %d compressed pages", ret);
+	ptr = buffer.mirror;
+	for (i = 0; i < buffer.size; i++)
+		ptr[i] = 65 + (i % 64);
+	ASSERT_EQ(hmm_dmirror_cmd(self->fd, HMM_DMIRROR_WRITE,
+				  &buffer, npages), 0);
+	ASSERT_EQ(buffer.cpages, npages);
+	ptr = buffer.ptr;
+	for (i = 0; i < buffer.size; i++)
+		ASSERT_EQ(ptr[i], 65 + (i % 64));
+
+	ASSERT_EQ(munmap(buffer.ptr, buffer.size), 0);
+	free(buffer.mirror);
 }
 
 /*
